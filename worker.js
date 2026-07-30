@@ -435,7 +435,7 @@ async function togglReportsRange(token, ws, a) {
 async function togglFetchRange(token, ws, a, depth=0) {
   if (a && rangeDays(a) > 93) return togglReportsRange(token, ws, a);
   if (!a || !a.start_date || !a.end_date) return await togglGet(token, '/me/time_entries');
-  const q = new URLSearchParams({ start_date:a.start_date, end_date:a.end_date });
+  const q = new URLSearchParams({ start_date:a.start_date, end_date:dAdd(a.end_date,1) });
   const e = await togglGet(token, '/me/time_entries?' + q);
   if (!Array.isArray(e) || e.length < 1000 || depth >= 8 || a.start_date===a.end_date) return e || [];
   const s = new Date(a.start_date+'T00:00:00Z'), z = new Date(a.end_date+'T00:00:00Z'), m = new Date(Math.floor((s.getTime()+z.getTime())/2));
