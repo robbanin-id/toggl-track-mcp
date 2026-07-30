@@ -1,0 +1,10 @@
+name = "toggl-track-mcp"
+main = "worker.js"
+compatibility_date = "2026-07-27"
+
+[vars]
+BASE_URL = "https://toggl-track-mcp.robbanin-id.workers.dev"
+
+[[kv_namespaces]]
+binding = "TOGGL_MCP_KV"
+id = "b710ffa304f345e089b5f7da7da2c60c"
