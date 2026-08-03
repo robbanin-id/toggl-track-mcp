@@ -475,7 +475,7 @@ function unionRanges(ranges, extra) {
 function mergeEntries(list, add) {
   const m = new Map(list.map(x=>[x.id,x]));
   for (const x of add) if (x && x.id != null) m.set(x.id, x);
-  let out = [...m.values()];
+  let out = [...m.values()].sort((a,b)=>String(a.start).localeCompare(String(b.start)));
   if (out.length > MAX_ENTRIES) out = out.slice(-MAX_ENTRIES);
   return out;
 }
@@ -595,11 +595,29 @@ function filterByDate(ctx, entries, a) {
     return true;
   });
 }
-function shapeEntry(ctx, x, fields) {
+function localParts(ts, tz) {
+  try {
+    const dtf = new Intl.DateTimeFormat('en-CA', { timeZone: tz||'UTC', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hour12:false });
+    const p = {}; for (const q of dtf.formatToParts(new Date(ts))) p[q.type]=q.value;
+    return { date: p.year+'-'+p.month+'-'+p.day, time: (p.hour==='24'?'00':p.hour)+':'+p.minute };
+  } catch { return { date: String(ts).slice(0,10), time: String(ts).slice(11,16) }; }
+}
+function dateFacts(entries, a, tz) {
+  const shift = (a.day_anchor === 'next_day') ? 1 : 0;
+  const counts = {};
+  for (const x of entries) { let dk = dayKey(x.start, tz); if (shift) dk = dAdd(dk,1); counts[dk] = (counts[dk]||0)+1; }
+  let s = a.start_date, e = a.end_date; if (shift) { s = dAdd(s,1); e = dAdd(e,1); }
+  const missing=[], dup=[]; let cur=s, guard=0;
+  while (cur <= e && guard++ < 400) { if (!counts[cur]) missing.push(cur); else if (counts[cur] > 1) dup.push(cur); cur = dAdd(cur,1); }
+  return { basis: shift ? 'night_of (day_anchor=next_day)' : 'local start date', timezone: tz, missing_dates: missing, duplicate_dates: dup };
+}
+function shapeEntry(ctx, x, fields, tz) {
   const fs = Array.isArray(fields) && fields.length ? fields : ['id','start','stop','duration','description','project_id','tags'];
   const o = {};
   for (const f of fs) {
     if (f === 'project_name' || f === 'project.name') o.project_name = ctx.projects?.[x.project_id]?.name || null;
+    else if (f === 'local_start_date' || f === 'local_start_time') { const lp = localParts(x.start, tz); if (f==='local_start_date') o.local_start_date = lp.date; else o.local_start_time = lp.time; }
+    else if (f === 'local_stop_date' || f === 'local_stop_time') { if (x.stop) { const lp = localParts(x.stop, tz); if (f==='local_stop_date') o.local_stop_date = lp.date; else o.local_stop_time = lp.time; } else o[f] = null; }
     else if (f in x) o[f] = x[f];
   }
   return o;
@@ -621,9 +639,9 @@ function cacheMeta(ctx, tz) {
 function toolsList() {
   const D = {
     get_current_time_entry: 'Read the currently running Toggl time entry.',
-    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range.',
-    get_summary: 'Return compact aggregated time totals instead of raw entries. Group by project, day, tag, or project_day. Groups include project_id + project_name.',
-    get_coverage: 'Check data coverage for a date range: daily counts, duration, gaps, completeness.',
+    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Entries are returned in CHRONOLOGICAL order (by start). Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. NEVER infer coverage from entry count ("31 entries = 31 days" is INVALID) — read meta.date_facts.missing_dates / duplicate_dates. For overnight activities such as sleep, request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day". Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range.',
+    get_summary: 'Return compact aggregated time totals instead of raw entries. Group by project, day, tag, or project_day. day/project_day group by the LOCAL date the entry STARTS (set day_anchor="next_day" for the night-of convention). Groups include project_id + project_name.',
+    get_coverage: 'Authoritative way to find dates with NO entries: per-day counts, tracked seconds, gaps. Use this (or meta.date_facts) instead of inferring coverage from entry counts. Honors timezone and day_anchor.',
     browse_projects_catalog: 'Admin/inspection only. DO NOT CALL for reports/analysis/filtering — project id+name already appear in get_summary groups and the projects map of get_time_entries_with_project_tag. Only to list ALL projects.',
     browse_tags_catalog: 'Admin/inspection only. DO NOT CALL for reports — tag names already appear inside each entry. Only to list ALL tags.',
     create_time_entry: 'Create a Toggl time entry.',
@@ -643,8 +661,9 @@ function toolsList() {
       start_date:{type:'string'}, end_date:{type:'string'},
       project_ids:{type:'array',items:{type:'number'}}, project_names:{type:'array',items:{type:'string'}},
       description_contains:{type:'string'}, min_duration_seconds:{type:'number'},
-      intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'}}, limit:{type:'number'},
+      intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted).'}, limit:{type:'number'},
       timezone:{type:'string'},
+      day_anchor:{type:'string',description:'"start" (default) = dates mean the calendar day the entry STARTS. "next_day" = night-of/opening-day convention (an entry starting the evening before belongs to the following day); server shifts window, missing_dates, and day grouping.'},
       force_refresh:{type:'boolean',description:'Bypass cache and ALWAYS call Toggl (costs quota). Only when the user explicitly asks to refresh or says data changed.'},
     },
     required:['start_date','end_date'],
@@ -652,8 +671,8 @@ function toolsList() {
   const t = [
     { name:'get_current_time_entry', inputSchema:{type:'object',properties:{}} },
     { name:'get_time_entries_with_project_tag', inputSchema: rangeSchema },
-    { name:'get_summary', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},group_by:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
-    { name:'get_coverage', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
+    { name:'get_summary', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},group_by:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
+    { name:'get_coverage', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
     { name:'browse_projects_catalog', inputSchema:{type:'object',properties:{}} },
     { name:'browse_tags_catalog', inputSchema:{type:'object',properties:{}} },
     { name:'create_time_entry', inputSchema:{type:'object',properties:{description:{type:'string'},start:{type:'string'},duration:{type:'number'},stop:{type:'string'},project_id:{type:'number'},tags:{type:'array',items:{type:'string'}},billable:{type:'boolean'}}} },
@@ -684,6 +703,7 @@ async function executeTool(name, a, env, grant) {
 
   if (name === 'get_time_entries_with_project_tag') {
     if (!a.start_date || !a.end_date) throw new Error('start_date and end_date are required');
+    if (a.day_anchor === 'next_day') { a.start_date = dAdd(a.start_date,-1); a.end_date = dAdd(a.end_date,-1); }
     const ds = parseDateWithTz(a.start_date, tz), de = parseDateWithTz(a.end_date, tz);
     if (isNaN(ds) || isNaN(de)) throw new Error('invalid dates');
     if (ds > de) throw new Error('start_date must be <= end_date');
@@ -694,7 +714,7 @@ async function executeTool(name, a, env, grant) {
     const limited = Number.isFinite(Number(a.limit)) ? out.slice(0, Math.min(1000, Math.max(1, Number(a.limit)))) : out.slice(0, 1000);
     const today = dayKey(Date.now(), tz);
     return {
-      entries: limited.map(x => shapeEntry(ctx, x, a.fields)),
+      entries: limited.map(x => shapeEntry(ctx, x, a.fields, tz)),
       projects: Object.fromEntries([...new Set(limited.map(x=>x.project_id).filter(Boolean))].map(id => [id, ctx.projects?.[id] || {id,name:'Unknown'}])),
       meta: {
         status:'ok', requested_start:a.start_date, requested_end:a.end_date,
@@ -702,6 +722,7 @@ async function executeTool(name, a, env, grant) {
         entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects,
         upstream_calls: ctx.prov.upstream,
         completeness: (out.length <= limited.length) ? ((a.end_date >= today) ? 'unverified' : true) : false,
+        date_facts: dateFacts(limited, a, tz),
         cache: cacheMeta(ctx, tz), source_timezone: tz,
       },
     };
@@ -709,6 +730,7 @@ async function executeTool(name, a, env, grant) {
 
   if (name === 'get_summary' || name === 'get_coverage') {
     if (!a.start_date || !a.end_date) throw new Error('start_date and end_date are required');
+    if (a.day_anchor === 'next_day') { a.start_date = dAdd(a.start_date,-1); a.end_date = dAdd(a.end_date,-1); }
     const ds = parseDateWithTz(a.start_date, tz), de = parseDateWithTz(a.end_date, tz);
     a.start_date = ds.toISOString().slice(0,10); a.end_date = de.toISOString().slice(0,10);
     a._startMs = ds.getTime(); a._endMs = de.getTime() + 86400000;
@@ -724,13 +746,15 @@ async function executeTool(name, a, env, grant) {
       const out = []; let cursor = new Date(dayKey(new Date(a._startMs).toISOString(), tz)+'T12:00:00Z');
       const limit = new Date(dayKey(new Date(a._endMs-1).toISOString(), tz)+'T12:00:00Z');
       while (cursor <= limit) { const k = cursor.toISOString().slice(0,10); out.push({ date:k, entry_count:(days[k]||{count:0}).count, tracked_seconds:(days[k]||{seconds:0}).seconds }); cursor.setUTCDate(cursor.getUTCDate()+1); }
-      return { days: out, gaps: out.filter(x=>!x.entry_count).map(x=>x.date), anomalies: rows.filter(x=>Math.abs(Number(x.duration||0))>86400).map(x=>({entry_id:x.id,type:'duration_over_24h',duration_seconds:x.duration})), meta: commonMeta };
+      const shiftC=(a.day_anchor==='next_day')?1:0;
+      const outA=shiftC?out.map(x=>({...x,date:dAdd(x.date,1)})):out;
+      return { days: outA, gaps: outA.filter(x=>!x.entry_count).map(x=>x.date), anomalies: rows.filter(x=>Math.abs(Number(x.duration||0))>86400).map(x=>({entry_id:x.id,type:'duration_over_24h',duration_seconds:x.duration})), meta: commonMeta };
     }
 
     const g = a.group_by || 'project', m = {};
     for (const x of rows) {
       const pn = ctx.projects?.[x.project_id]?.name || 'Unknown';
-      const day = dayKey(x.start, tz);
+      let day = dayKey(x.start, tz); if (a.day_anchor === 'next_day') day = dAdd(day,1);
       const keys = g==='day' ? [day] : g==='tag' ? (x.tags||[]).map(t=>'tag:'+t) : g==='project_day' ? [x.project_id+':'+day] : [x.project_id+':'+pn];
       for (const k of keys) {
         const z = m[k] || (m[k]={key:k,count:0,seconds:0});
@@ -808,7 +832,7 @@ async function handleMCP(request, env, grant) {
       protocolVersion: body.params?.protocolVersion || MCP_PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: 'toggl-track-mcp', version: '1.0.0' },
-      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
+      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
     }});
   }
   if (method === 'notifications/initialized') return new Response(null, { status: 202, headers: CORS });
