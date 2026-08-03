@@ -602,6 +602,28 @@ function localParts(ts, tz) {
     return { date: p.year+'-'+p.month+'-'+p.day, time: (p.hour==='24'?'00':p.hour)+':'+p.minute };
   } catch { return { date: String(ts).slice(0,10), time: String(ts).slice(11,16) }; }
 }
+function filterDiagnostics(ctx, a) {
+  const names = (a.project_names || []).map(String);
+  if (!names.length || !ctx.projects) return undefined;
+  const all = Object.values(ctx.projects).map(p => p.name).filter(Boolean);
+  const lower = all.map(n => n.toLowerCase());
+  const unmatched = names.filter(n => lower.indexOf(n.toLowerCase()) === -1);
+  if (!unmatched.length) return undefined;
+  const pre = [], sub = [];
+  for (let i = 0; i < all.length; i++) {
+    const ln = lower[i];
+    for (const u of unmatched) {
+      const q = u.toLowerCase(); if (!q) continue;
+      if (ln.indexOf(q) === 0) { pre.push(all[i]); break; }
+      if (ln.indexOf(q) > 0) { sub.push(all[i]); break; }
+    }
+  }
+  const ranked = pre.concat(sub);
+  const LIMIT = 20;
+  const out = { project_names_unmatched: unmatched, match_mode: 'exact (case-insensitive)', available_similar: ranked.slice(0, LIMIT), similar_total: ranked.length };
+  if (ranked.length > LIMIT) { out.similar_truncated = true; out.note = 'Showing ' + LIMIT + ' of ' + ranked.length + ' similar project names (ranked: prefix matches first). Narrow the query text for the rest; the projects map in this response already carries every project referenced by the returned entries.'; }
+  return out;
+}
 function dateFacts(entries, a, tz) {
   const shift = (a.day_anchor === 'next_day') ? 1 : 0;
   const counts = {};
@@ -639,7 +661,7 @@ function cacheMeta(ctx, tz) {
 function toolsList() {
   const D = {
     get_current_time_entry: 'Read the currently running Toggl time entry.',
-    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Entries are returned in CHRONOLOGICAL order (by start). Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. NEVER infer coverage from entry count ("31 entries = 31 days" is INVALID) — read meta.date_facts.missing_dates / duplicate_dates. For overnight activities such as sleep, request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day". Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range.',
+    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Entries are returned in CHRONOLOGICAL order (by start). Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. NEVER infer coverage from entry count ("31 entries = 31 days" is INVALID) — read meta.date_facts.missing_dates / duplicate_dates. For overnight activities such as sleep, request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day". Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range. project_names is EXACT match (case-insensitive): projects whose names merely share a prefix or word are DIFFERENT projects and must not be treated as the same. Use names exactly as they appear in the projects map or get_summary groups; if a name does not match, meta.filter_diagnostics lists the unmatched name plus similar existing names \u2014 no catalog call needed.',
     get_summary: 'Return compact aggregated time totals instead of raw entries. Group by project, day, tag, or project_day. day/project_day group by the LOCAL date the entry STARTS (set day_anchor="next_day" for the night-of convention). Groups include project_id + project_name.',
     get_coverage: 'Authoritative way to find dates with NO entries: per-day counts, tracked seconds, gaps. Use this (or meta.date_facts) instead of inferring coverage from entry counts. Honors timezone and day_anchor.',
     browse_projects_catalog: 'Admin/inspection only. DO NOT CALL for reports/analysis/filtering — project id+name already appear in get_summary groups and the projects map of get_time_entries_with_project_tag. Only to list ALL projects.',
@@ -723,6 +745,7 @@ async function executeTool(name, a, env, grant) {
         upstream_calls: ctx.prov.upstream,
         completeness: (out.length <= limited.length) ? ((a.end_date >= today) ? 'unverified' : true) : false,
         date_facts: dateFacts(limited, a, tz),
+        filter_diagnostics: filterDiagnostics(ctx, a),
         cache: cacheMeta(ctx, tz), source_timezone: tz,
       },
     };
@@ -732,13 +755,12 @@ async function executeTool(name, a, env, grant) {
     if (!a.start_date || !a.end_date) throw new Error('start_date and end_date are required');
     if (a.day_anchor === 'next_day') { a.start_date = dAdd(a.start_date,-1); a.end_date = dAdd(a.end_date,-1); }
     const ds = parseDateWithTz(a.start_date, tz), de = parseDateWithTz(a.end_date, tz);
-    a.start_date = ds.toISOString().slice(0,10); a.end_date = de.toISOString().slice(0,10);
     a._startMs = ds.getTime(); a._endMs = de.getTime() + 86400000;
     await ensureEntries(ctx, a, { force: !!a.force_refresh });
     await ensureProjects(ctx);
     const rows = filterByDate(ctx, ctx.entries, a);
     const today = dayKey(Date.now(), tz);
-    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), source_timezone: tz, completeness: (a.end_date >= today) ? 'unverified' : true };
+    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), filter_diagnostics: filterDiagnostics(ctx, a), source_timezone: tz, completeness: (a.end_date >= today) ? 'unverified' : true };
 
     if (name === 'get_coverage') {
       const days = {};
