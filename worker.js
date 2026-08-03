@@ -371,6 +371,14 @@ function dayKey(ts, tz) {
   try { return new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'UTC', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date(ts)); }
   catch { return String(ts).slice(0,10); }
 }
+function normalizeBounds(a, tz) {
+  // Keep _startMs/_endMs time-precise, but force start_date/end_date to pure local YYYY-MM-DD.
+  // Cache ranges / warm windows / fetch params must never hold datetime strings:
+  // lexicographic comparison would let a half-day claim a whole day.
+  a.start_date = dayKey(a._startMs, tz);
+  a.end_date = dayKey(a._endMs - 1, tz);
+  return a;
+}
 function dAdd(str, n) { return new Date(new Date(str+'T00:00:00Z').getTime() + n*86400000).toISOString().slice(0,10); }
 function parseDateWithTz(str, tz) {
   if (!str) return new Date(NaN);
@@ -725,11 +733,14 @@ async function executeTool(name, a, env, grant) {
 
   if (name === 'get_time_entries_with_project_tag') {
     if (!a.start_date || !a.end_date) throw new Error('start_date and end_date are required');
-    if (a.day_anchor === 'next_day') { a.start_date = dAdd(a.start_date,-1); a.end_date = dAdd(a.end_date,-1); }
+    const dsRaw = parseDateWithTz(a.start_date, tz), deRaw = parseDateWithTz(a.end_date, tz);
+    if (isNaN(dsRaw) || isNaN(deRaw)) throw new Error('invalid dates');
+    if (a.day_anchor === 'next_day') { a.start_date = dayKey(dsRaw.getTime()-86400000, tz); a.end_date = dayKey(endExclusiveMs(a.end_date, deRaw)-86400000-1, tz); }
     const ds = parseDateWithTz(a.start_date, tz), de = parseDateWithTz(a.end_date, tz);
     if (isNaN(ds) || isNaN(de)) throw new Error('invalid dates');
     if (ds > de) throw new Error('start_date must be <= end_date');
     a._startMs = ds.getTime(); a._endMs = endExclusiveMs(a.end_date, de);
+    normalizeBounds(a, tz);
     await ensureEntries(ctx, a, { force: !!a.force_refresh });
     await ensureProjects(ctx);
     const out = filterByDate(ctx, ctx.entries, a);
@@ -753,9 +764,12 @@ async function executeTool(name, a, env, grant) {
 
   if (name === 'get_summary' || name === 'get_coverage') {
     if (!a.start_date || !a.end_date) throw new Error('start_date and end_date are required');
-    if (a.day_anchor === 'next_day') { a.start_date = dAdd(a.start_date,-1); a.end_date = dAdd(a.end_date,-1); }
+    const dsRaw2 = parseDateWithTz(a.start_date, tz), deRaw2 = parseDateWithTz(a.end_date, tz);
+    if (isNaN(dsRaw2) || isNaN(deRaw2)) throw new Error('invalid dates');
+    if (a.day_anchor === 'next_day') { a.start_date = dayKey(dsRaw2.getTime()-86400000, tz); a.end_date = dayKey(endExclusiveMs(a.end_date, deRaw2)-86400000-1, tz); }
     const ds = parseDateWithTz(a.start_date, tz), de = parseDateWithTz(a.end_date, tz);
-    a._startMs = ds.getTime(); a._endMs = de.getTime() + 86400000;
+    a._startMs = ds.getTime(); a._endMs = endExclusiveMs(a.end_date, de);
+    normalizeBounds(a, tz);
     await ensureEntries(ctx, a, { force: !!a.force_refresh });
     await ensureProjects(ctx);
     const rows = filterByDate(ctx, ctx.entries, a);
