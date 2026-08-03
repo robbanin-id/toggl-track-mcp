@@ -275,6 +275,7 @@ async function handleOAuth(request, env, url) {
       workspace_id: workspaceId,
       workspace_name: workspaceName,
       toggl_user_id: me.id,
+      toggl_timezone: me.timezone || null,
       created_at: Date.now(),
     };
     await kvPut(env, 'code:' + code, authReq, CODE_TTL);
@@ -311,6 +312,7 @@ async function handleOAuth(request, env, url) {
         workspace_id: authReq.workspace_id,
         workspace_name: authReq.workspace_name,
         toggl_user_id: authReq.toggl_user_id,
+        toggl_timezone: authReq.toggl_timezone || null,
         scope: 'mcp',
         created_at: Date.now(),
       };
@@ -460,7 +462,7 @@ async function makeCtx(env, grant) {
   const ws = String(grant.workspace_id);
   const acctHash = await sha256(token + ':' + ws);
   return {
-    env, token, ws, acctHash,
+    env, token, ws, acctHash, profileTz: grant.toggl_timezone || null,
     kEntries: 'u:' + acctHash + ':entries',
     kProjects: 'u:' + acctHash + ':projects',
     kTags: 'u:' + acctHash + ':tags',
@@ -653,13 +655,13 @@ function dateFacts(entries, a, tz) {
   while (cur <= e && guard++ < 400) { if (!counts[cur]) missing.push(cur); else if (counts[cur] > 1) dup.push(cur); cur = dAdd(cur,1); }
   return { basis: shift ? 'night_of (day_anchor=next_day)' : 'local start date', timezone: tz, missing_dates: missing, duplicate_dates: dup };
 }
-function shapeEntry(ctx, x, fields, tz) {
+function shapeEntry(ctx, x, fields, tz, tzKnown) {
   const fs = Array.isArray(fields) && fields.length ? fields : ['id','start','stop','duration','description','project_id','tags'];
   const o = {};
   for (const f of fs) {
     if (f === 'project_name' || f === 'project.name') o.project_name = ctx.projects?.[x.project_id]?.name || null;
-    else if (f === 'local_start_date' || f === 'local_start_time') { const lp = localParts(x.start, tz); if (f==='local_start_date') o.local_start_date = lp.date; else o.local_start_time = lp.time; }
-    else if (f === 'local_stop_date' || f === 'local_stop_time') { if (x.stop) { const lp = localParts(x.stop, tz); if (f==='local_stop_date') o.local_stop_date = lp.date; else o.local_stop_time = lp.time; } else o[f] = null; }
+    else if (f === 'local_start_date' || f === 'local_start_time') { const lp = localParts(x.start, tz); const k = (tzKnown === false) ? (f==='local_start_date' ? 'utc_start_date' : 'utc_start_time') : f; o[k] = (f==='local_start_date') ? lp.date : lp.time; }
+    else if (f === 'local_stop_date' || f === 'local_stop_time') { const k = (tzKnown === false) ? (f==='local_stop_date' ? 'utc_stop_date' : 'utc_stop_time') : f; if (x.stop) { const lp = localParts(x.stop, tz); o[k] = (f==='local_stop_date') ? lp.date : lp.time; } else o[k] = null; }
     else if (f in x) o[f] = x[f];
   }
   return o;
@@ -703,7 +705,7 @@ function toolsList() {
       start_date:{type:'string'}, end_date:{type:'string'},
       project_ids:{type:'array',items:{type:'number'}}, project_names:{type:'array',items:{type:'string'}},
       description_contains:{type:'string',description:'Case-insensitive substring in the entry DESCRIPTION only. This does not search project names. If it returns zero, inspect meta.filter_diagnostics before concluding no activity exists.'}, min_duration_seconds:{type:'number'},
-      intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted).'}, limit:{type:'number',description:'Max entries per page (default and cap 1000).'}, offset:{type:'number',description:'Zero-based page offset. Use meta.pagination.next_offset to fetch the next page with otherwise identical arguments.'},
+      intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted). If the timezone is unknown (no argument and no profile timezone), these are returned as utc_* instead of local_* and meta.warnings explains why \u2014 never present utc_* values as local wall-clock time.'}, limit:{type:'number',description:'Max entries per page (default and cap 1000).'}, offset:{type:'number',description:'Zero-based page offset. Use meta.pagination.next_offset to fetch the next page with otherwise identical arguments.'},
       timezone:{type:'string'},
       day_anchor:{type:'string',description:'"start" (default) = dates mean the calendar day the entry STARTS. "next_day" = night-of/opening-day convention (an entry starting the evening before belongs to the following day); server shifts window, missing_dates, and day grouping.'},
       force_refresh:{type:'boolean',description:'Bypass cache and ALWAYS call Toggl (costs quota). Only when the user explicitly asks to refresh or says data changed.'},
@@ -736,7 +738,9 @@ function toolsList() {
 async function executeTool(name, a, env, grant) {
   if (!grant) throw new Error('Not authenticated');
   const ctx = await makeCtx(env, grant);
-  const ws = ctx.ws, token = ctx.token, tz = a.timezone || 'UTC';
+  const ws = ctx.ws, token = ctx.token, tz = a.timezone || ctx.profileTz || 'UTC';
+  const tzKnown = !!(a.timezone || ctx.profileTz);
+  const tzSource = a.timezone ? 'requested' : (ctx.profileTz ? 'profile' : 'fallback_utc');
 
   if (name === 'get_current_time_entry') {
     ctx.prov.upstream.push('/me/time_entries/current');
@@ -763,7 +767,7 @@ async function executeTool(name, a, env, grant) {
     const pgFiltered = !!((a.project_ids && a.project_ids.length) || (a.project_names && a.project_names.length) || a.description_contains);
     const today = dayKey(Date.now(), tz);
     return {
-      entries: limited.map(x => shapeEntry(ctx, x, a.fields, tz)),
+      entries: limited.map(x => shapeEntry(ctx, x, a.fields, tz, tzKnown)),
       projects: Object.fromEntries([...new Set(limited.map(x=>x.project_id).filter(Boolean))].map(id => [id, ctx.projects?.[id] || {id,name:'Unknown'}])),
       meta: {
         status:'ok', requested_start:a.start_date, requested_end:a.end_date,
@@ -775,7 +779,8 @@ async function executeTool(name, a, env, grant) {
         pagination: { offset: pgOff, limit: pgLimit, returned: limited.length, total_count: out.length, has_more: pgHasMore, next_offset: pgHasMore ? (pgOff + limited.length) : null, report_ready: !pgHasMore },
         truncation_hint: pgHasMore ? { reason: 'result_exceeds_page_limit', project_filter_applied: pgFiltered, recommended: pgFiltered ? 'Repeat this exact request with offset=next_offset and merge all pages before analysing.' : 'Narrow the query with project_ids/project_names first (or use get_summary); paginate with offset=next_offset only if the filtered result still exceeds the page limit.' } : undefined,
         filter_diagnostics: filterDiagnostics(ctx, a),
-        cache: cacheMeta(ctx, tz), source_timezone: tz,
+        cache: cacheMeta(ctx, tz), source_timezone: tz, times_are_in: tz, timezone_source: tzSource,
+        warnings: tzKnown ? undefined : ['Times are rendered in UTC because no timezone argument was given and the Toggl profile timezone was unavailable. Local time fields are named utc_* instead of local_* to avoid mislabelling. Pass timezone (e.g. "Asia/Jakarta") for correct local times and day boundaries.'],
       },
     };
   }
@@ -792,7 +797,7 @@ async function executeTool(name, a, env, grant) {
     await ensureProjects(ctx);
     const rows = filterByDate(ctx, ctx.entries, a);
     const today = dayKey(Date.now(), tz);
-    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), filter_diagnostics: filterDiagnostics(ctx, a), source_timezone: tz, completeness: (a.end_date >= today) ? 'unverified' : true };
+    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), filter_diagnostics: filterDiagnostics(ctx, a), source_timezone: tz, times_are_in: tz, timezone_source: tzSource, warnings: tzKnown ? undefined : ['Times are rendered in UTC because no timezone argument was given and the Toggl profile timezone was unavailable. Pass timezone (e.g. "Asia/Jakarta") for correct local times and day boundaries.'], completeness: (a.end_date >= today) ? 'unverified' : true };
 
     if (name === 'get_coverage') {
       const days = {};
