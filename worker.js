@@ -586,6 +586,13 @@ async function ensureEntries(ctx, a, opts) {
   ctx.entriesAt = Date.now(); if (touchesToday) ctx.todayAt = Date.now();
   await saveEntriesCache(ctx);
 }
+function effDuration(x) {
+  const d = Number(x && x.duration);
+  if (Number.isFinite(d) && d >= 0) return d;
+  const st = (x && x.start) ? new Date(x.start).getTime() : NaN;
+  if (!isNaN(st)) return Math.max(0, Math.floor((Date.now() - st) / 1000));
+  return 0;
+}
 function filterByDate(ctx, entries, a) {
   let s = a._startMs || 0, e = a._endMs || Infinity;
   if (a.intersects_range && a._startMs) { s = a._startMs; e = a._endMs; }
@@ -601,7 +608,7 @@ function filterByDate(ctx, entries, a) {
     if (pids.length && !pids.includes(Number(x.project_id))) return false;
     if (names.length && !names.some(n => String(ctx.projects?.[x.project_id]?.name||'').toLowerCase() === n.toLowerCase())) return false;
     if (a.description_contains && !String(x.description||'').toLowerCase().includes(String(a.description_contains).toLowerCase())) return false;
-    if (minDur > 0 && Math.abs(Number(x.duration||0)) < minDur) return false;
+    if (minDur > 0 && effDuration(x) < minDur) return false;
     return true;
   });
 }
@@ -704,8 +711,8 @@ function toolsList() {
     properties:{
       start_date:{type:'string'}, end_date:{type:'string'},
       project_ids:{type:'array',items:{type:'number'}}, project_names:{type:'array',items:{type:'string'}},
-      description_contains:{type:'string',description:'Case-insensitive substring in the entry DESCRIPTION only. This does not search project names. If it returns zero, inspect meta.filter_diagnostics before concluding no activity exists.'}, min_duration_seconds:{type:'number'},
-      intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted). If the timezone is unknown (no argument and no profile timezone), these are returned as utc_* instead of local_* and meta.warnings explains why \u2014 never present utc_* values as local wall-clock time.'}, limit:{type:'number',description:'Max entries per page (default and cap 1000).'}, offset:{type:'number',description:'Zero-based page offset. Use meta.pagination.next_offset to fetch the next page with otherwise identical arguments.'},
+      description_contains:{type:'string',description:'Case-insensitive substring in the entry DESCRIPTION only. This does not search project names. If it returns zero, inspect meta.filter_diagnostics before concluding no activity exists.'}, min_duration_seconds:{type:'number',description:'Minimum duration in seconds. Running entries are measured as elapsed time so far. Useful for locating long blocks when categorisation is unreliable (missing or wrong project): combine with fields [local_start_time, local_stop_time] to screen candidates by time pattern instead of by project.'},
+      intersects_range:{type:'boolean',description:'If true, return entries whose interval OVERLAPS the query range instead of only those whose start falls inside it. Required to see activities that cross midnight from the previous day. Use day_anchor="next_day" instead when each overnight block should belong to a single night.'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted). If the timezone is unknown (no argument and no profile timezone), these are returned as utc_* instead of local_* and meta.warnings explains why \u2014 never present utc_* values as local wall-clock time.'}, limit:{type:'number',description:'Max entries per page (default and cap 1000).'}, offset:{type:'number',description:'Zero-based page offset. Use meta.pagination.next_offset to fetch the next page with otherwise identical arguments.'},
       timezone:{type:'string'},
       day_anchor:{type:'string',description:'"start" (default) = dates mean the calendar day the entry STARTS. "next_day" = night-of/opening-day convention (an entry starting the evening before belongs to the following day); server shifts window, missing_dates, and day grouping.'},
       force_refresh:{type:'boolean',description:'Bypass cache and ALWAYS call Toggl (costs quota). Only when the user explicitly asks to refresh or says data changed.'},
@@ -801,13 +808,13 @@ async function executeTool(name, a, env, grant) {
 
     if (name === 'get_coverage') {
       const days = {};
-      for (const x of rows) { const d = dayKey(x.start, tz); const z = days[d] || (days[d]={count:0,seconds:0}); z.count++; z.seconds += Math.max(0, Number(x.duration||0)); }
+      for (const x of rows) { const d = dayKey(x.start, tz); const z = days[d] || (days[d]={count:0,seconds:0}); z.count++; z.seconds += effDuration(x); }
       const out = []; let cursor = new Date(dayKey(new Date(a._startMs).toISOString(), tz)+'T12:00:00Z');
       const limit = new Date(dayKey(new Date(a._endMs-1).toISOString(), tz)+'T12:00:00Z');
       while (cursor <= limit) { const k = cursor.toISOString().slice(0,10); out.push({ date:k, entry_count:(days[k]||{count:0}).count, tracked_seconds:(days[k]||{seconds:0}).seconds }); cursor.setUTCDate(cursor.getUTCDate()+1); }
       const shiftC=(a.day_anchor==='next_day')?1:0;
       const outA=shiftC?out.map(x=>({...x,date:dAdd(x.date,1)})):out;
-      return { days: outA, gaps: outA.filter(x=>!x.entry_count).map(x=>x.date), anomalies: rows.filter(x=>Math.abs(Number(x.duration||0))>86400).map(x=>({entry_id:x.id,type:'duration_over_24h',duration_seconds:x.duration})), meta: commonMeta };
+      return { days: outA, gaps: outA.filter(x=>!x.entry_count).map(x=>x.date), anomalies: rows.filter(x=>x.stop&&effDuration(x)>86400).map(x=>({entry_id:x.id,type:'duration_over_24h',duration_seconds:x.duration})), meta: commonMeta };
     }
 
     const g = a.group_by || 'project', m = {};
@@ -820,7 +827,7 @@ async function executeTool(name, a, env, grant) {
         if (g==='project'||g==='project_day') { z.project_id = x.project_id||null; z.project_name = pn; }
         if (g==='day'||g==='project_day') z.date = day;
         if (g==='tag') z.tag = k.slice(4);
-        z.count++; z.seconds += Math.max(0, Number(x.duration||0));
+        z.count++; z.seconds += effDuration(x);
       }
     }
     return { groups: Object.values(m), meta: commonMeta };
@@ -891,7 +898,7 @@ async function handleMCP(request, env, grant) {
       protocolVersion: body.params?.protocolVersion || MCP_PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: 'toggl-track-mcp', version: '1.0.0' },
-      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. description_contains searches entry description text only, not project names; if it returns zero, inspect meta.filter_diagnostics and retry with an exact project_names value when appropriate. Do not call the project catalog because the primary read tool already loaded project data. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. Raw entries are paginated (max 1000): when meta.pagination.report_ready is false the data is partial \u2014 narrow the filter or continue with offset=meta.pagination.next_offset before reporting. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
+      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. description_contains searches entry description text only, not project names; if it returns zero, inspect meta.filter_diagnostics and retry with an exact project_names value when appropriate. Do not call the project catalog because the primary read tool already loaded project data. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. A zero-result filter only means that filter did not match \u2014 it does NOT prove the data is absent. Before concluding something does not exist, check meta.filter_diagnostics and meta.date_facts. If the user states the data exists, or diagnostics show the range does contain entries while the filter returned zero, switch to pattern-based search (min_duration_seconds + intersects_range, no project filter) before answering; if the range is genuinely empty, "none" is the correct answer. Raw entries are paginated (max 1000): when meta.pagination.report_ready is false the data is partial \u2014 narrow the filter or continue with offset=meta.pagination.next_offset before reporting. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
     }});
   }
   if (method === 'notifications/initialized') return new Response(null, { status: 202, headers: CORS });
