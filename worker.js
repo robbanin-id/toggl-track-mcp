@@ -611,26 +611,38 @@ function localParts(ts, tz) {
   } catch { return { date: String(ts).slice(0,10), time: String(ts).slice(11,16) }; }
 }
 function filterDiagnostics(ctx, a) {
+  const out = {};
   const names = (a.project_names || []).map(String);
-  if (!names.length || !ctx.projects) return undefined;
-  const all = Object.values(ctx.projects).map(p => p.name).filter(Boolean);
-  const lower = all.map(n => n.toLowerCase());
-  const unmatched = names.filter(n => lower.indexOf(n.toLowerCase()) === -1);
-  if (!unmatched.length) return undefined;
-  const pre = [], sub = [];
-  for (let i = 0; i < all.length; i++) {
-    const ln = lower[i];
-    for (const u of unmatched) {
-      const q = u.toLowerCase(); if (!q) continue;
-      if (ln.indexOf(q) === 0) { pre.push(all[i]); break; }
-      if (ln.indexOf(q) > 0) { sub.push(all[i]); break; }
+  if (names.length && ctx.projects) {
+    const all = Object.values(ctx.projects).map(p => p.name).filter(Boolean);
+    const lower = all.map(n => n.toLowerCase());
+    const unmatched = names.filter(n => lower.indexOf(n.toLowerCase()) === -1);
+    if (unmatched.length) {
+      const pre = [], sub = [];
+      for (let i=0;i<all.length;i++) {
+        const ln=lower[i];
+        for (const u of unmatched) { const q=u.toLowerCase(); if(!q) continue; if(ln.indexOf(q)===0){pre.push(all[i]);break} if(ln.indexOf(q)>0){sub.push(all[i]);break} }
+      }
+      const ranked=pre.concat(sub), LIMIT=20;
+      out.project_names_unmatched=unmatched; out.match_mode='exact (case-insensitive)'; out.available_similar=ranked.slice(0,LIMIT); out.similar_total=ranked.length;
+      if(ranked.length>LIMIT){out.similar_truncated=true;out.note='Showing '+LIMIT+' of '+ranked.length+' similar project names (ranked: prefix matches first). Narrow the query text; do not call the project catalog because the primary tool already loaded project data.';}
     }
   }
-  const ranked = pre.concat(sub);
-  const LIMIT = 20;
-  const out = { project_names_unmatched: unmatched, match_mode: 'exact (case-insensitive)', available_similar: ranked.slice(0, LIMIT), similar_total: ranked.length };
-  if (ranked.length > LIMIT) { out.similar_truncated = true; out.note = 'Showing ' + LIMIT + ' of ' + ranked.length + ' similar project names (ranked: prefix matches first). Narrow the query text for the rest; the projects map in this response already carries every project referenced by the returned entries.'; }
-  return out;
+  if (a.description_contains) {
+    const base = {...a}; delete base.description_contains;
+    const before = filterByDate(ctx, ctx.entries, base), matched = filterByDate(ctx, ctx.entries, a);
+    if (!matched.length) {
+      const qd=String(a.description_contains).toLowerCase(), counts={};
+      for (const x of before) { const pid=String(x.project_id); counts[pid]=(counts[pid]||0)+1; }
+      const projects=Object.values(ctx.projects||{}).filter(p=>p&&p.name).map(p=>{const n=String(p.name),ln=n.toLowerCase(),rank=ln.indexOf(qd)===0?0:(ln.indexOf(qd)>=0?1:2);return {project_id:p.id,project_name:n,entries_before_description_filter:counts[String(p.id)]||0,match_rank:rank};});
+      const similar=projects.filter(p=>p.match_rank<2).sort((x,y)=>x.match_rank-y.match_rank||y.entries_before_description_filter-x.entries_before_description_filter||x.project_name.localeCompare(y.project_name));
+      const fallback=projects.filter(p=>p.entries_before_description_filter>0).sort((x,y)=>y.entries_before_description_filter-x.entries_before_description_filter||x.project_name.localeCompare(y.project_name));
+      const candidates=similar.length?similar:fallback, LIMIT=20;
+      out.description_filter={query:a.description_contains,matched_entries:0,entries_before_description_filter:before.length,meaning:'description_contains searches entry descriptions only; zero matches do not prove the requested activity or project is absent.',candidate_projects:candidates.slice(0,LIMIT),candidate_projects_total:candidates.length,suggested_action:'If the intended activity is tracked as a project, retry with project_names using an exact project_name from candidate_projects. Do not call the project catalog; this response already loaded project data.'};
+      if(candidates.length>LIMIT) out.description_filter.candidate_projects_truncated=true;
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 function dateFacts(entries, a, tz) {
   const shift = (a.day_anchor === 'next_day') ? 1 : 0;
@@ -669,7 +681,7 @@ function cacheMeta(ctx, tz) {
 function toolsList() {
   const D = {
     get_current_time_entry: 'Read the currently running Toggl time entry.',
-    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Entries are returned in CHRONOLOGICAL order (by start). Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. NEVER infer coverage from entry count ("31 entries = 31 days" is INVALID) — read meta.date_facts.missing_dates / duplicate_dates. For overnight activities such as sleep, request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day". Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range. project_names is EXACT match (case-insensitive): projects whose names merely share a prefix or word are DIFFERENT projects and must not be treated as the same. Use names exactly as they appear in the projects map or get_summary groups; if a name does not match, meta.filter_diagnostics lists the unmatched name plus similar existing names \u2014 no catalog call needed.',
+    get_time_entries_with_project_tag: 'Get time entries for a date range. PRIMARY tool for reading time data. Entries are returned in CHRONOLOGICAL order (by start). Each entry includes: id, start, stop, duration, description, tags (tag names as strings), project_id. Project NAMES are in the top-level "projects" map of THIS SAME response — resolve via projects[project_id].name. No need to call browse_projects_catalog or browse_tags_catalog. NEVER infer coverage from entry count ("31 entries = 31 days" is INVALID) — read meta.date_facts.missing_dates / duplicate_dates. For overnight activities such as sleep, request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day". Filter: project_ids, project_names, description_contains, min_duration_seconds, intersects_range. description_contains searches entry description text only, not project names; if it returns zero, inspect meta.filter_diagnostics and retry with an exact project_names value when appropriate. project_names is EXACT match (case-insensitive): projects whose names merely share a prefix or word are DIFFERENT projects and must not be treated as the same. Use names exactly as they appear in the projects map or get_summary groups; if a name does not match, meta.filter_diagnostics lists the unmatched name plus similar existing names \u2014 no catalog call needed.',
     get_summary: 'Return compact aggregated time totals instead of raw entries. Group by project, day, tag, or project_day. day/project_day group by the LOCAL date the entry STARTS (set day_anchor="next_day" for the night-of convention). Groups include project_id + project_name.',
     get_coverage: 'Authoritative way to find dates with NO entries: per-day counts, tracked seconds, gaps. Use this (or meta.date_facts) instead of inferring coverage from entry counts. Honors timezone and day_anchor.',
     browse_projects_catalog: 'Admin/inspection only. DO NOT CALL for reports/analysis/filtering — project id+name already appear in get_summary groups and the projects map of get_time_entries_with_project_tag. Only to list ALL projects.',
@@ -690,7 +702,7 @@ function toolsList() {
     properties:{
       start_date:{type:'string'}, end_date:{type:'string'},
       project_ids:{type:'array',items:{type:'number'}}, project_names:{type:'array',items:{type:'string'}},
-      description_contains:{type:'string'}, min_duration_seconds:{type:'number'},
+      description_contains:{type:'string',description:'Case-insensitive substring in the entry DESCRIPTION only. This does not search project names. If it returns zero, inspect meta.filter_diagnostics before concluding no activity exists.'}, min_duration_seconds:{type:'number'},
       intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted).'}, limit:{type:'number'},
       timezone:{type:'string'},
       day_anchor:{type:'string',description:'"start" (default) = dates mean the calendar day the entry STARTS. "next_day" = night-of/opening-day convention (an entry starting the evening before belongs to the following day); server shifts window, missing_dates, and day grouping.'},
@@ -868,7 +880,7 @@ async function handleMCP(request, env, grant) {
       protocolVersion: body.params?.protocolVersion || MCP_PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: 'toggl-track-mcp', version: '1.0.0' },
-      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
+      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. description_contains searches entry description text only, not project names; if it returns zero, inspect meta.filter_diagnostics and retry with an exact project_names value when appropriate. Do not call the project catalog because the primary read tool already loaded project data. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
     }});
   }
   if (method === 'notifications/initialized') return new Response(null, { status: 202, headers: CORS });
