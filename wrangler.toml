@@ -8,3 +8,11 @@ BASE_URL = "https://toggl-track-mcp.robbanin-id.workers.dev"
 [[kv_namespaces]]
 binding = "TOGGL_MCP_KV"
 id = "b710ffa304f345e089b5f7da7da2c60c"
+
+[[durable_objects.bindings]]
+name = "OAUTH_STATE"
+class_name = "OAuthStateDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OAuthStateDO"]
