@@ -888,7 +888,7 @@ export default {
         if (!grant) return new Response('Unauthorized', { status: 401, headers: { ...CORS, 'WWW-Authenticate': 'Bearer resource_metadata="' + env.BASE_URL + '/.well-known/oauth-protected-resource"' } });
         return handleMCP(request, env, grant);
       }
-      if (path === '/' || path === '/healthz') return json({ ok: true, server: 'toggl-track-mcp', version: '1.0.0', tools: toolsList().length });
+      if (path === '/' || path === '/healthz') return json({ ok: true, server: 'toggl-track-mcp', version: '1.1.0', tools: toolsList().length });
       return new Response('Not found', { status: 404, headers: CORS });
     } catch (e) {
       return json({ error: e.message || 'Internal error' }, 500);
