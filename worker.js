@@ -5,7 +5,8 @@
 const ACCESS_TTL  = 3600;      // 1 hour
 const REFRESH_TTL = 2592000;   // 30 days
 const CODE_TTL    = 600;       // 10 min
-const MCP_PROTOCOL = '2025-03-26';
+// MCP clients in the wild negotiate these protocol versions, with Aside currently using the latest.
+const MCP_PROTOCOL = '2025-11-25';
 const TOGGL_BASE = 'https://api.track.toggl.com/api/v9';
 const REPORTS_BASE = 'https://api.track.toggl.com/reports/api/v3';
 
@@ -59,9 +60,16 @@ async function pkceS256(verifier) { return b64urlBytes(new Uint8Array(await cryp
 function validPkceVerifier(v) { return typeof v === 'string' && /^[A-Za-z0-9\-\._~]{43,128}$/.test(v); }
 function validPkceChallenge(v) { return typeof v === 'string' && /^[A-Za-z0-9_-]{43}$/.test(v); }
 function safeUrl(value) { try { return new URL(String(value)); } catch { return null; } }
+function isLoopbackHost(host) {
+  const h = String(host || '').toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
 function validRedirectUri(value) {
   const u = safeUrl(value);
-  return !!u && u.protocol === 'https:' && !u.username && !u.password && !u.hash && u.href.length <= 2048;
+  if (!u || u.username || u.password || u.hash || u.href.length > 2048) return false;
+  // HTTPS is required for remote clients. HTTP is allowed only for native-app
+  // loopback callbacks such as Aside's 127.0.0.1 daemon callback.
+  return u.protocol === 'https:' || (u.protocol === 'http:' && isLoopbackHost(u.hostname));
 }
 function jsonError(error, description, status=400) { return json({ error, error_description: description }, status); }
 async function oauthStateCall(env, key, op, record, ttlSeconds) {
@@ -182,7 +190,7 @@ async function handleOAuth(request, env, url) {
     const cnt = Number(await kvGet(env, rlKey) || 0); if (cnt >= 20) return jsonError('rate_limited','Too many registrations',429); await kvPut(env, rlKey, cnt + 1, 3600);
     let body = {}; try { body = await request.json(); } catch { return jsonError('invalid_client_metadata','JSON body required'); }
     const redirectUris = body.redirect_uris;
-    if (!Array.isArray(redirectUris) || !redirectUris.length || redirectUris.length > 10 || !redirectUris.every(u => validRedirectUri(u))) return jsonError('invalid_redirect_uri','redirect_uris must contain only exact HTTPS URIs');
+    if (!Array.isArray(redirectUris) || !redirectUris.length || redirectUris.length > 10 || !redirectUris.every(u => validRedirectUri(u))) return jsonError('invalid_redirect_uri','redirect_uris must contain exact HTTPS URIs or loopback HTTP URIs');
     const clientId = randomHex(16), client = { client_id:clientId, client_name:String(body.client_name || 'MCP Client').slice(0,120), redirect_uris:[...redirectUris], grant_types:['authorization_code','refresh_token'], response_types:['code'], token_endpoint_auth_method:'none', created_at:Date.now() };
     await kvPut(env, 'client:' + clientId, client); return json(client,201);
   }
@@ -790,7 +798,7 @@ async function togglWrite(token, method, path, body) {
   return d;
 }
 
-const MCP_PROTOCOLS = [MCP_PROTOCOL];
+const MCP_PROTOCOLS = [MCP_PROTOCOL, '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const TOOL_KEYS = {
   get_current_time_entry: [],
   get_time_entries_with_project_tag: ['start_date','end_date','project_ids','project_names','description_contains','min_duration_seconds','intersects_range','fields','limit','offset','timezone','day_anchor','force_refresh'],
@@ -840,7 +848,7 @@ async function handleMCP(request, env, grant) {
   const id=body.id??null, method=body.method;
   if(method==='initialize'){
     const requested=body.params?.protocolVersion||MCP_PROTOCOL; const negotiated=MCP_PROTOCOLS.includes(requested)?requested:MCP_PROTOCOL;
-    return json({jsonrpc:'2.0',id,result:{protocolVersion:negotiated,capabilities:{tools:{}},serverInfo:{name:'toggl-track-mcp',version:'1.1.0'},instructions:'Read-first, cache-first Toggl time tracking for YOUR connected account. The primary read tool is get_time_entries_with_project_tag with a 1000-entry page cap. If report_ready is false, continue with offset or narrow the filter before reporting. Use get_summary or get_coverage for aggregates. Do not call catalogs for normal reporting. end_date is inclusive and end_date+1 is used internally for Toggl v9. Provide timezone for local boundaries. force_refresh costs Toggl quota and is only for explicit user refresh requests.'}});
+    return json({jsonrpc:'2.0',id,result:{protocolVersion:negotiated,capabilities:{tools:{}},serverInfo:{name:'toggl-track-mcp',version:'1.2.0'},instructions:'Read-first, cache-first Toggl time tracking for YOUR connected account. The primary read tool is get_time_entries_with_project_tag with a 1000-entry page cap. If report_ready is false, continue with offset or narrow the filter before reporting. Use get_summary or get_coverage for aggregates. Do not call catalogs for normal reporting. end_date is inclusive and end_date+1 is used internally for Toggl v9. Provide timezone for local boundaries. force_refresh costs Toggl quota and is only for explicit user refresh requests.'}});
   }
   if(method==='notifications/initialized')return new Response(null,{status:202,headers:CORS});
   if(method==='ping')return json({jsonrpc:'2.0',id,result:{}});
@@ -885,10 +893,10 @@ export default {
       if (path === '/api/validate-toggl' && request.method === 'POST') return handleValidateToggl(request, env);
       if (path === '/mcp' || (path === '/' && request.method === 'POST')) {
         const grant = await authenticate(request, env);
-        if (!grant) return new Response('Unauthorized', { status: 401, headers: { ...CORS, 'WWW-Authenticate': 'Bearer resource_metadata="' + env.BASE_URL + '/.well-known/oauth-protected-resource"' } });
+        if (!grant) return json({ error: 'unauthorized', error_description: 'Bearer access token required' }, 401, { 'Cache-Control': 'no-store', 'WWW-Authenticate': 'Bearer resource_metadata="' + env.BASE_URL + '/.well-known/oauth-protected-resource", scope="mcp"' });
         return handleMCP(request, env, grant);
       }
-      if (path === '/' || path === '/healthz') return json({ ok: true, server: 'toggl-track-mcp', version: '1.1.0', tools: toolsList().length });
+      if (path === '/' || path === '/healthz') return json({ ok: true, server: 'toggl-track-mcp', version: '1.2.0', tools: toolsList().length });
       return new Response('Not found', { status: 404, headers: CORS });
     } catch (e) {
       return json({ error: e.message || 'Internal error' }, 500);
