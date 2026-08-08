@@ -13,7 +13,7 @@ const REPORTS_BASE = 'https://api.track.toggl.com/reports/api/v3';
 const IMMUTABLE_TTL = 2592000000; // 30d — past days immutable
 const TODAY_TTL     = 3600000;    // 60m — current day mutable edge
 const WARM_DAYS     = 10;         // widen narrow reads to a 10-day block
-const MAX_ENTRIES   = 10000;
+const MAX_ENTRIES   = 50000; // soft safety ceiling; raw response page cap remains 1000
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -34,32 +34,56 @@ function randomHex(n = 32) {
 function hex2buf(h) { return new Uint8Array(h.match(/.{1,2}/g).map(b => parseInt(b,16))); }
 function buf2hex(b) { return [...b].map(x => x.toString(16).padStart(2,'0')).join(''); }
 async function getEncryptionKey(env) {
-  if (env.ENCRYPTION_KEY) return env.ENCRYPTION_KEY;
-  let key = await kvGet(env, '_encryption_key');
-  if (key) return key;
-  key = randomHex(32);
-  await kvPut(env, '_encryption_key', key);
+  const key = String(env.ENCRYPTION_KEY || '').trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(key)) throw new Error('OAuth encryption is not configured safely');
   return key;
 }
 async function encrypt(plain, env) {
   const keyHex = await getEncryptionKey(env);
   const key = await crypto.subtle.importKey('raw', hex2buf(keyHex), 'AES-GCM', false, ['encrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plain));
+  const enc = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, new TextEncoder().encode(plain));
   return buf2hex(iv) + ':' + buf2hex(new Uint8Array(enc));
 }
 async function decrypt(data, env) {
   const keyHex = await getEncryptionKey(env);
-  const [ivHex, ctHex] = data.split(':');
+  const parts = String(data || '').split(':');
+  if (parts.length !== 2 || !/^[0-9a-fA-F]+$/.test(parts[0]) || !/^[0-9a-fA-F]+$/.test(parts[1])) throw new Error('Invalid encrypted credential');
   const key = await crypto.subtle.importKey('raw', hex2buf(keyHex), 'AES-GCM', false, ['decrypt']);
-  const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: hex2buf(ivHex) }, key, hex2buf(ctHex));
+  const dec = await crypto.subtle.decrypt({ name:'AES-GCM', iv:hex2buf(parts[0]) }, key, hex2buf(parts[1]));
   return new TextDecoder().decode(dec);
 }
+async function sha256hex(msg) { return await sha256(msg); }
+function b64urlBytes(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_'); }
+async function pkceS256(verifier) { return b64urlBytes(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)))); }
+function validPkceVerifier(v) { return typeof v === 'string' && /^[A-Za-z0-9\-\._~]{43,128}$/.test(v); }
+function validPkceChallenge(v) { return typeof v === 'string' && /^[A-Za-z0-9_-]{43}$/.test(v); }
+function safeUrl(value) { try { return new URL(String(value)); } catch { return null; } }
+function validRedirectUri(value) {
+  const u = safeUrl(value);
+  return !!u && u.protocol === 'https:' && !u.username && !u.password && !u.hash && u.href.length <= 2048;
+}
+function jsonError(error, description, status=400) { return json({ error, error_description: description }, status); }
+async function oauthStateCall(env, key, op, record, ttlSeconds) {
+  if (!env.OAUTH_STATE) throw new Error('OAuth state storage is not configured');
+  const id = env.OAUTH_STATE.idFromName(String(key));
+  const stub = env.OAUTH_STATE.get(id);
+  const r = await stub.fetch('https://oauth-state.internal/' + encodeURIComponent(String(key)), { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ op, record, ttl:ttlSeconds || CODE_TTL }) });
+  if (!r.ok) throw new Error('OAuth state storage failure');
+  const d = await r.json();
+  if (!d.ok) throw new Error(d.error || 'OAuth state storage failure');
+  return d.value;
+}
+async function oauthStateCreate(env, key, record, ttlSeconds) { return await oauthStateCall(env, key, 'create', record, ttlSeconds); }
+async function oauthStateGet(env, key) { return await oauthStateCall(env, key, 'get'); }
+async function oauthStateConsume(env, key) { return await oauthStateCall(env, key, 'consume'); }
+async function oauthStateRevoke(env, key) { return await oauthStateCall(env, key, 'revoke'); }
+
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json', ...CORS, ...headers } });
 }
-function html(body, status = 200) {
-  return new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', ...CORS } });
+function html(body, status = 200, headers = {}) {
+  return new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', ...CORS, ...headers } });
 }
 function redirect(url) { return Response.redirect(url, 302); }
 async function kvGet(env, key) {
@@ -101,7 +125,9 @@ const OAUTH_META = (base) => ({
   issuer: base,
   authorization_endpoint: base + '/authorize',
   token_endpoint: base + '/token',
+  revocation_endpoint: base + '/revoke',
   registration_endpoint: base + '/register',
+  resource_indicators_supported: true,
   scopes_supported: ['mcp'],
   response_types_supported: ['code'],
   grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -117,241 +143,123 @@ const RESOURCE_META = (base) => ({
 
 // ─── Authorize page (bring-your-own Toggl token) ─────────────────────────────
 function AUTHORIZE_PAGE(params) {
-  // params: {state, redirect_uri, oauth_client_id, code_challenge}
-  const p = JSON.stringify(params);
+  const tx = JSON.stringify(String(params.transaction_id || '')).replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026');
+  const nonce = String(params.csp_nonce || '');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connect Toggl Track</title>
-<style>
-  :root{color-scheme:light dark}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:440px;margin:6vh auto;padding:0 20px;line-height:1.5}
-  h1{font-size:1.35rem;margin-bottom:.25rem}
-  .sub{color:#666;font-size:.9rem;margin-bottom:1.5rem}
-  label{display:block;font-weight:600;margin:1rem 0 .35rem;font-size:.9rem}
-  input,select{width:100%;padding:.6rem .7rem;font-size:1rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box;background:transparent;color:inherit}
-  button{margin-top:1.25rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#e57cd8;color:#111;cursor:pointer}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .err{color:#c0392b;font-size:.85rem;margin-top:.5rem;min-height:1em}
-  .ok{color:#27ae60}
-  .hint{font-size:.8rem;color:#888;margin-top:.3rem}
-  a{color:#c86bc0}
-  .step2{display:none}
+<style nonce="${nonce}">
+:root{color-scheme:light dark}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:440px;margin:6vh auto;padding:0 20px;line-height:1.5}h1{font-size:1.35rem;margin-bottom:.25rem}.sub{color:#666;font-size:.9rem;margin-bottom:1.5rem}label{display:block;font-weight:600;margin:1rem 0 .35rem;font-size:.9rem}input,select{width:100%;padding:.6rem .7rem;font-size:1rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box;background:transparent;color:inherit}button{margin-top:1.25rem;width:100%;padding:.7rem;font-size:1rem;font-weight:600;border:0;border-radius:8px;background:#e57cd8;color:#111;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.err{color:#c0392b;font-size:.85rem;margin-top:.5rem;min-height:1em}.hint{font-size:.8rem;color:#888;margin-top:.3rem}a{color:#c86bc0}.step2{display:none}
 </style></head><body>
 <h1>Connect your Toggl Track</h1>
-<div class="sub">This connects an AI client to <b>your own</b> Toggl account. Your API token is stored encrypted and never shared with the AI client.</div>
-
-<div id="step1">
-  <label>Toggl API Token</label>
-  <input id="tok" type="password" placeholder="Paste your Toggl API token" autocomplete="off">
-  <div class="hint">Find it at <a href="https://track.toggl.com/profile" target="_blank" rel="noopener">track.toggl.com/profile</a> → API Token (bottom of page).</div>
-  <button id="fetchBtn">Fetch my workspaces</button>
-  <div class="err" id="err1"></div>
-</div>
-
-<div id="step2" class="step2">
-  <label>Workspace</label>
-  <select id="ws"></select>
-  <div class="hint" id="whoami"></div>
-  <button id="connectBtn">Connect</button>
-  <div class="err" id="err2"></div>
-</div>
-
-<form id="finalForm" method="POST" action="/authorize" style="display:none">
-  <input type="hidden" name="toggl_token" id="f_tok">
-  <input type="hidden" name="workspace_id" id="f_ws">
-  <input type="hidden" name="workspace_name" id="f_wsn">
-  <input type="hidden" name="params" id="f_params">
-</form>
-
-<script>
-  var PARAMS = ${p};
-  var tokEl=document.getElementById('tok'), wsEl=document.getElementById('ws');
-  document.getElementById('fetchBtn').addEventListener('click', async function(){
-    var e1=document.getElementById('err1'); e1.textContent='';
-    var t=tokEl.value.trim(); if(!t){e1.textContent='Please paste your token.';return;}
-    this.disabled=true; this.textContent='Checking...';
-    try{
-      var r=await fetch('/api/validate-toggl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
-      var d=await r.json();
-      if(!r.ok||!d.ok){e1.textContent=d.error||'Invalid token.';this.disabled=false;this.textContent='Fetch my workspaces';return;}
-      wsEl.innerHTML='';
-      d.workspaces.forEach(function(w){var o=document.createElement('option');o.value=w.id;o.textContent=w.name;if(w.id===d.default_workspace_id)o.selected=true;wsEl.appendChild(o);});
-      document.getElementById('whoami').textContent='Signed in as '+(d.fullname||'Toggl user');
-      document.getElementById('step1').style.display='none';
-      document.getElementById('step2').style.display='block';
-    }catch(err){e1.textContent='Network error. Try again.';this.disabled=false;this.textContent='Fetch my workspaces';}
-  });
-  document.getElementById('connectBtn').addEventListener('click', function(){
-    document.getElementById('f_tok').value=tokEl.value.trim();
-    document.getElementById('f_ws').value=wsEl.value;
-    document.getElementById('f_wsn').value=wsEl.options[wsEl.selectedIndex].textContent;
-    document.getElementById('f_params').value=JSON.stringify(PARAMS);
-    document.getElementById('finalForm').submit();
-  });
-</script>
-</body></html>`;
+<div class="sub">This connects an AI client to <b>your own</b> Toggl account. Your API token is encrypted and never shared with the AI client.</div>
+<div id="step1"><label for="tok">Toggl API Token</label><input id="tok" type="password" placeholder="Paste your Toggl API token" autocomplete="off"><div class="hint">Find it at <a href="https://track.toggl.com/profile" target="_blank" rel="noopener noreferrer">track.toggl.com/profile</a> → API Token.</div><button id="fetchBtn" type="button">Fetch my workspaces</button><div class="err" id="err1" role="alert"></div></div>
+<div id="step2" class="step2"><label for="ws">Workspace</label><select id="ws"></select><div class="hint" id="whoami"></div><button id="connectBtn" type="button">Connect</button><div class="err" id="err2" role="alert"></div></div>
+<form id="finalForm" method="POST" action="/authorize" style="display:none"><input type="hidden" name="transaction_id" id="f_tx"><input type="hidden" name="validation_id" id="f_val"><input type="hidden" name="workspace_id" id="f_ws"></form>
+<script nonce="${nonce}">
+(function(){var TX_ID=${tx},tokEl=document.getElementById('tok'),wsEl=document.getElementById('ws'),validationId='';
+document.getElementById('fetchBtn').addEventListener('click',async function(){var btn=this,e1=document.getElementById('err1');e1.textContent='';var t=tokEl.value.trim();if(!t){e1.textContent='Please paste your token.';return;}btn.disabled=true;btn.textContent='Checking...';try{var r=await fetch('/api/validate-toggl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transaction_id:TX_ID,token:t})});var d=await r.json();if(!r.ok||!d.ok){e1.textContent=d.error||'Invalid token.';btn.disabled=false;btn.textContent='Fetch my workspaces';return;}validationId=d.validation_id;while(wsEl.firstChild)wsEl.removeChild(wsEl.firstChild);(d.workspaces||[]).forEach(function(w){var o=document.createElement('option');o.value=String(w.id);o.textContent=String(w.name||w.id);wsEl.appendChild(o);});tokEl.value='';document.getElementById('whoami').textContent='Signed in as '+(d.fullname||'Toggl user');document.getElementById('step1').style.display='none';document.getElementById('step2').style.display='block';}catch(e){e1.textContent='Network error. Try again.';btn.disabled=false;btn.textContent='Fetch my workspaces';}});
+document.getElementById('connectBtn').addEventListener('click',function(){var e2=document.getElementById('err2');e2.textContent='';if(!validationId||!wsEl.value){e2.textContent='Choose a workspace.';return;}document.getElementById('f_tx').value=TX_ID;document.getElementById('f_val').value=validationId;document.getElementById('f_ws').value=wsEl.value;document.getElementById('finalForm').submit();});})();
+</script></body></html>`;
 }
 
 // ─── OAuth handler ───────────────────────────────────────────────────────────
+async function issueOAuthTokens(env, grantId, grant, clientId, resource) {
+  const accessToken = randomHex(32), refreshToken = randomHex(32);
+  const now = Date.now();
+  await kvPut(env, 'token:' + await sha256(accessToken), { grant_id:grantId, type:'access', client_id:clientId, resource, expires_at:now + ACCESS_TTL*1000 }, ACCESS_TTL);
+  await oauthStateCreate(env, 'refresh:' + await sha256(refreshToken), { grant_id:grantId, type:'refresh', client_id:clientId, resource, expires_at:now + REFRESH_TTL*1000 }, REFRESH_TTL);
+  return { access_token:accessToken, token_type:'Bearer', expires_in:ACCESS_TTL, refresh_token:refreshToken, scope:'mcp' };
+}
 async function handleOAuth(request, env, url) {
-  const base = env.BASE_URL;
+  const base = String(env.BASE_URL || '').replace(/\/$/,'');
   const path = url.pathname;
-
   if (path === '/.well-known/oauth-authorization-server') return json(OAUTH_META(base));
   if (path === '/.well-known/oauth-protected-resource') return json(RESOURCE_META(base));
 
-  // Dynamic Client Registration (RFC 7591) — strict validation + rate-limit
   if (path === '/register' && request.method === 'POST') {
-    // rate-limit per IP: max 20 registrations / hour
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const rlKey = 'rl:reg:' + ip;
-    const cnt = (await kvGet(env, rlKey)) || 0;
-    if (cnt >= 20) return json({ error: 'rate_limited', error_description: 'Too many registrations' }, 429);
-    await kvPut(env, rlKey, cnt + 1, 3600);
-
-    let body = {};
-    try { body = await request.json(); } catch {}
-    const redirectUris = Array.isArray(body.redirect_uris) && body.redirect_uris.length
-      ? body.redirect_uris
-      : ['https://claude.ai/api/mcp/auth_callback', 'https://chatgpt.com/connector/oauth/callback'];
-    // strict: only allow https redirect URIs
-    if (!redirectUris.every(u => typeof u === 'string' && u.startsWith('https://'))) {
-      return json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris must be https' }, 400);
-    }
-    const clientId = randomHex(16);
-    const client = {
-      client_id: clientId,
-      client_name: (body.client_name || 'MCP Client').toString().slice(0, 120),
-      redirect_uris: redirectUris,
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
-      token_endpoint_auth_method: 'none',
-      created_at: Date.now(),
-    };
-    await kvPut(env, 'client:' + clientId, client);
-    return json(client, 201);
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown', rlKey = 'rl:reg:' + ip;
+    const cnt = Number(await kvGet(env, rlKey) || 0); if (cnt >= 20) return jsonError('rate_limited','Too many registrations',429); await kvPut(env, rlKey, cnt + 1, 3600);
+    let body = {}; try { body = await request.json(); } catch { return jsonError('invalid_client_metadata','JSON body required'); }
+    const redirectUris = body.redirect_uris;
+    if (!Array.isArray(redirectUris) || !redirectUris.length || redirectUris.length > 10 || !redirectUris.every(u => validRedirectUri(u))) return jsonError('invalid_redirect_uri','redirect_uris must contain only exact HTTPS URIs');
+    const clientId = randomHex(16), client = { client_id:clientId, client_name:String(body.client_name || 'MCP Client').slice(0,120), redirect_uris:[...redirectUris], grant_types:['authorization_code','refresh_token'], response_types:['code'], token_endpoint_auth_method:'none', created_at:Date.now() };
+    await kvPut(env, 'client:' + clientId, client); return json(client,201);
   }
 
-  // Authorize (GET) — show the bring-your-own-token page
   if (path === '/authorize' && request.method === 'GET') {
-    const { searchParams } = url;
-    const params = {
-      state: searchParams.get('state') || '',
-      redirect_uri: searchParams.get('redirect_uri') || '',
-      oauth_client_id: searchParams.get('client_id') || '',
-      code_challenge: searchParams.get('code_challenge') || '',
-    };
-    // validate redirect_uri belongs to a registered client (best-effort; allow known hosts)
-    if (params.oauth_client_id) {
-      const client = await kvGet(env, 'client:' + params.oauth_client_id);
-      if (client && params.redirect_uri && !client.redirect_uris.includes(params.redirect_uri)) {
-        return html('Invalid redirect_uri for this client.', 400);
-      }
-    }
-    return html(AUTHORIZE_PAGE(params));
+    const q = url.searchParams, clientId=q.get('client_id')||'', redirectUri=q.get('redirect_uri')||'', state=q.get('state')||'', responseType=q.get('response_type')||'', challenge=q.get('code_challenge')||'', method=q.get('code_challenge_method')||'', resource=q.get('resource')||'', scope=q.get('scope')||'mcp';
+    const client = clientId ? await kvGet(env,'client:' + clientId) : null;
+    if (!client) return jsonError('invalid_request','Unknown client_id');
+    if (responseType !== 'code') return jsonError('unsupported_response_type','Only response_type=code is supported');
+    if (!state) return jsonError('invalid_request','state is required');
+    if (!client.redirect_uris.includes(redirectUri) || !validRedirectUri(redirectUri)) return jsonError('invalid_request','redirect_uri is not registered for this client');
+    if (method !== 'S256' || !validPkceChallenge(challenge)) return jsonError('invalid_request','PKCE S256 code_challenge is required');
+    if (resource !== base + '/mcp') return jsonError('invalid_target','resource must be the MCP endpoint');
+    if (scope !== 'mcp') return jsonError('invalid_scope','Only scope=mcp is supported');
+    const transactionId = randomHex(32);
+    await oauthStateCreate(env,'tx:' + transactionId,{ type:'authorization_request', client_id:clientId, redirect_uri:redirectUri, state, code_challenge:challenge, code_challenge_method:'S256', resource, scope, created_at:Date.now() },CODE_TTL);
+    const nonce = randomHex(16);
+    return html(AUTHORIZE_PAGE({transaction_id:transactionId,csp_nonce:nonce}),200,{ 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer', 'X-Content-Type-Options':'nosniff', 'Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'nonce-"+nonce+"'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
   }
 
-  // Authorize (POST) — user submitted token + workspace; issue auth code
   if (path === '/authorize' && request.method === 'POST') {
-    const form = await request.formData();
-    const togglToken = (form.get('toggl_token') || '').toString().trim();
-    const workspaceId = (form.get('workspace_id') || '').toString().trim();
-    const workspaceName = (form.get('workspace_name') || '').toString();
-    let params = {};
-    try { params = JSON.parse(form.get('params') || '{}'); } catch {}
-
-    if (!togglToken || !workspaceId) return html('Missing token or workspace. <a href="/authorize">Retry</a>.', 400);
-    // Re-validate token server-side (do not trust client)
-    const me = await togglMe(togglToken);
-    if (!me) return html('Invalid Toggl API token. <a href="/authorize">Retry</a>.', 400);
-
-    const code = randomHex(32);
-    const authReq = {
-      oauth_client_id: params.oauth_client_id || '',
-      redirect_uri: params.redirect_uri || '',
-      code_challenge: params.code_challenge || '',
-      code_challenge_method: 'S256',
-      toggl_token_enc: await encrypt(togglToken, env),
-      workspace_id: workspaceId,
-      workspace_name: workspaceName,
-      toggl_user_id: me.id,
-      toggl_timezone: me.timezone || null,
-      created_at: Date.now(),
-    };
-    await kvPut(env, 'code:' + code, authReq, CODE_TTL);
-
-    if (!params.redirect_uri) return html('Connected. You can close this window.');
-    const cb = new URL(params.redirect_uri);
-    cb.searchParams.set('code', code);
-    cb.searchParams.set('state', params.state || '');
-    return redirect(cb.toString());
+    let form; try { form = await request.formData(); } catch { return html('Invalid form.',400); }
+    const transactionId=String(form.get('transaction_id')||''), validationId=String(form.get('validation_id')||''), workspaceId=String(form.get('workspace_id')||'');
+    if (!/^[0-9a-f]{64}$/.test(transactionId) || !/^[0-9a-f]{64}$/.test(validationId) || !/^\d+$/.test(workspaceId)) return html('Invalid authorization transaction.',400);
+    const tx=await oauthStateGet(env,'tx:'+transactionId), val=await oauthStateGet(env,'val:'+validationId);
+    if (!tx || tx.type!=='authorization_request' || !val || val.type!=='toggl_validation' || val.transaction_id!==transactionId) return html('Authorization session expired. Restart the connection.',400);
+    const ws=(val.workspaces||[]).find(x=>String(x.id)===workspaceId); if(!ws) return html('Workspace is not available for this token.',400);
+    const code=randomHex(32), codeHash=await sha256(code);
+    await oauthStateCreate(env,'code:'+codeHash,{ type:'authorization_code', client_id:tx.client_id, redirect_uri:tx.redirect_uri, resource:tx.resource, scope:tx.scope, code_challenge:tx.code_challenge, code_challenge_method:tx.code_challenge_method, toggl_token_enc:val.toggl_token_enc, workspace_id:String(ws.id), workspace_name:String(ws.name||''), toggl_user_id:val.toggl_user_id, toggl_timezone:val.toggl_timezone||null, created_at:Date.now() },CODE_TTL);
+    await oauthStateRevoke(env,'tx:'+transactionId); await oauthStateRevoke(env,'val:'+validationId);
+    const cb=new URL(tx.redirect_uri); cb.searchParams.set('code',code); cb.searchParams.set('state',tx.state); return redirect(cb.toString());
   }
 
-  // Token exchange
   if (path === '/token' && request.method === 'POST') {
-    const form = await request.formData();
-    const grantType = form.get('grant_type');
-
-    if (grantType === 'authorization_code') {
-      const code = form.get('code');
-      const codeVerifier = form.get('code_verifier');
-      const authReq = await kvGet(env, 'code:' + code);
-      if (!authReq) return json({ error: 'invalid_grant', error_description: 'Code not found or expired' }, 400);
-
-      if (authReq.code_challenge) {
-        const hash = await sha256(codeVerifier || '');
-        const expected = btoa(String.fromCharCode(...hash.match(/.{2}/g).map(b=>parseInt(b,16)))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
-        if (expected !== authReq.code_challenge && hash !== authReq.code_challenge) {
-          return json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, 400);
-        }
-      }
-      await kvDel(env, 'code:' + code);
-
-      const grant = {
-        toggl_token_enc: authReq.toggl_token_enc,
-        workspace_id: authReq.workspace_id,
-        workspace_name: authReq.workspace_name,
-        toggl_user_id: authReq.toggl_user_id,
-        toggl_timezone: authReq.toggl_timezone || null,
-        scope: 'mcp',
-        created_at: Date.now(),
-      };
-      const grantId = randomHex(16);
-      await kvPut(env, 'grant:' + grantId, grant);
-
-      const accessToken = randomHex(32), refreshToken = randomHex(32);
-      await kvPut(env, 'token:' + await sha256(accessToken), { grant_id: grantId, type: 'access', expires_at: Date.now() + ACCESS_TTL*1000 }, ACCESS_TTL);
-      await kvPut(env, 'token:' + await sha256(refreshToken), { grant_id: grantId, type: 'refresh', expires_at: Date.now() + REFRESH_TTL*1000 }, REFRESH_TTL);
-      return json({ access_token: accessToken, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token: refreshToken, scope: 'mcp' });
+    let form; try { form=await request.formData(); } catch { return jsonError('invalid_request','Form body required'); }
+    const grantType=String(form.get('grant_type')||''), clientId=String(form.get('client_id')||''), resource=String(form.get('resource')||'');
+    if (grantType==='authorization_code') {
+      const code=String(form.get('code')||''), redirectUri=String(form.get('redirect_uri')||''), verifier=String(form.get('code_verifier')||'');
+      if(!/^[0-9a-f]{64}$/.test(code)||!clientId||!validRedirectUri(redirectUri)||resource!==base+'/mcp'||!validPkceVerifier(verifier)) return jsonError('invalid_grant','Invalid authorization code request');
+      const key='code:'+await sha256(code), authReq=await oauthStateGet(env,key);
+      if(!authReq||authReq.type!=='authorization_code'||authReq.client_id!==clientId||authReq.redirect_uri!==redirectUri||authReq.resource!==resource) return jsonError('invalid_grant','Authorization code binding failed');
+      if(await pkceS256(verifier)!==authReq.code_challenge) return jsonError('invalid_grant','PKCE verification failed');
+      const consumed=await oauthStateConsume(env,key); if(!consumed) return jsonError('invalid_grant','Authorization code already used or expired');
+      const grantId=randomHex(16), grant={toggl_token_enc:consumed.toggl_token_enc,workspace_id:consumed.workspace_id,workspace_name:consumed.workspace_name,toggl_user_id:consumed.toggl_user_id,toggl_timezone:consumed.toggl_timezone||null,client_id:clientId,resource,scope:'mcp',created_at:Date.now(),expires_at:Date.now()+(REFRESH_TTL+3600)*1000};
+      await kvPut(env,'grant:'+grantId,grant,REFRESH_TTL+3600); return json(await issueOAuthTokens(env,grantId,grant,clientId,resource));
     }
-
-    if (grantType === 'refresh_token') {
-      const refreshToken = form.get('refresh_token');
-      const stored = await kvGet(env, 'token:' + await sha256(refreshToken || ''));
-      if (!stored || stored.type !== 'refresh') return json({ error: 'invalid_grant' }, 400);
-      await kvDel(env, 'token:' + await sha256(refreshToken));
-      const grantId = stored.grant_id;
-      const nA = randomHex(32), nR = randomHex(32);
-      await kvPut(env, 'token:' + await sha256(nA), { grant_id: grantId, type: 'access', expires_at: Date.now()+ACCESS_TTL*1000 }, ACCESS_TTL);
-      await kvPut(env, 'token:' + await sha256(nR), { grant_id: grantId, type: 'refresh', expires_at: Date.now()+REFRESH_TTL*1000 }, REFRESH_TTL);
-      return json({ access_token: nA, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token: nR, scope: 'mcp' });
+    if(grantType==='refresh_token') {
+      const refreshToken=String(form.get('refresh_token')||''); if(!clientId||resource!==base+'/mcp'||!refreshToken) return jsonError('invalid_grant','Refresh token binding failed');
+      const key='refresh:'+await sha256(refreshToken), stored=await oauthStateGet(env,key); if(!stored||stored.type!=='refresh'||stored.client_id!==clientId||stored.resource!==resource||stored.expires_at<Date.now()) return jsonError('invalid_grant','Refresh token invalid or expired');
+      const consumed=await oauthStateConsume(env,key); if(!consumed) return jsonError('invalid_grant','Refresh token already used or expired');
+      const grant=await kvGet(env,'grant:'+consumed.grant_id); if(!grant||grant.revoked_at||(grant.expires_at&&grant.expires_at<Date.now())) return jsonError('invalid_grant','Grant revoked or expired');
+      return json(await issueOAuthTokens(env,consumed.grant_id,grant,clientId,resource));
     }
-    return json({ error: 'unsupported_grant_type' }, 400);
+    return jsonError('unsupported_grant_type','Only authorization_code and refresh_token are supported');
   }
 
+  if(path==='/revoke'&&request.method==='POST') {
+    let form; try{form=await request.formData();}catch{return json({},200);} const token=String(form.get('token')||''); if(!token)return json({},200);
+    const hash=await sha256(token), access=await kvGet(env,'token:'+hash); if(access) await kvDel(env,'token:'+hash);
+    const refresh=await oauthStateGet(env,'refresh:'+hash); if(refresh){await oauthStateRevoke(env,'refresh:'+hash);const grant=await kvGet(env,'grant:'+refresh.grant_id);if(grant&&!grant.revoked_at){grant.revoked_at=Date.now();await kvPut(env,'grant:'+refresh.grant_id,grant,REFRESH_TTL+3600);}}
+    return json({},200);
+  }
   return null;
 }
 
 // Validate-toggl endpoint used by the authorize page (returns workspaces). NEVER log token.
 async function handleValidateToggl(request, env) {
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const token = (body.token || '').toString().trim();
-  if (!token) return json({ ok: false, error: 'Token required' }, 400);
-  const me = await togglMe(token);
-  if (!me) return json({ ok: false, error: 'Invalid token' }, 400);
-  const ws = await togglWorkspaces(token);
-  return json({ ok: true, fullname: me.fullname || null, default_workspace_id: me.default_workspace_id || null, workspaces: ws });
+  let body={}; try{body=await request.json();}catch{return json({ok:false,error:'Invalid request'},400);}
+  const transactionId=String(body.transaction_id||''), token=String(body.token||'').trim();
+  if(!/^[0-9a-f]{64}$/.test(transactionId)||!token||token.length>512||/[\u0000-\u001f\u007f]/.test(token)) return json({ok:false,error:'Invalid authorization request'},400);
+  const ip=request.headers.get('CF-Connecting-IP')||'unknown', rlKey='rl:validate:'+ip, cnt=Number(await kvGet(env,rlKey)||0); if(cnt>=10)return json({ok:false,error:'Too many validation attempts'},429); await kvPut(env,rlKey,cnt+1,3600);
+  const tx=await oauthStateGet(env,'tx:'+transactionId); if(!tx||tx.type!=='authorization_request') return json({ok:false,error:'Authorization session expired'},400);
+  const me=await togglMe(token); if(!me)return json({ok:false,error:'Invalid token'},400);
+  const workspaces=await togglWorkspaces(token); if(!workspaces.length)return json({ok:false,error:'No accessible workspaces'},400);
+  const validationId=randomHex(32); const togglTokenEnc=await encrypt(token,env);
+  await oauthStateCreate(env,'val:'+validationId,{type:'toggl_validation',transaction_id:transactionId,toggl_token_enc:togglTokenEnc,toggl_user_id:me.id,toggl_timezone:me.timezone||null,fullname:me.fullname||null,default_workspace_id:me.default_workspace_id||null,workspaces},CODE_TTL);
+  return json({ok:true,validation_id:validationId,fullname:me.fullname||null,default_workspace_id:me.default_workspace_id||null,workspaces});
 }
 
 // Resolve grant → decrypted toggl credentials. NEVER log token.
@@ -363,7 +271,7 @@ async function authenticate(request, env) {
   if (!stored || stored.type !== 'access') return null;
   if (stored.expires_at < Date.now()) return null;
   const grant = await kvGet(env, 'grant:' + stored.grant_id);
-  if (!grant) return null;
+  if (!grant || grant.revoked_at || (grant.expires_at && grant.expires_at < Date.now())) return null;
   return grant;
 }
 
@@ -421,8 +329,10 @@ async function togglGet(token, path) {
     const t = await r.text();
     let d; try { d = JSON.parse(t); } catch { d = t; }
     if (r.ok) return d;
-    if (r.status === 429 || r.status >= 500) { await new Promise(res=>setTimeout(res,1100*(i+1))); continue; }
-    throw new Error('Toggl ' + r.status);
+    const reset=r.headers&&r.headers.get?r.headers.get('X-Toggl-Quota-Resets-In'):null, rem=r.headers&&r.headers.get?r.headers.get('X-Toggl-Quota-Remaining'):null;
+    if(r.status===402)throw new Error('Toggl quota exhausted'+(reset?' (resets in '+reset+' seconds)':'')+(rem?' (remaining: '+rem+')':''));
+    if(r.status===429||r.status>=500){if(i===2)throw new Error('Toggl '+r.status+(reset?' (retry after '+reset+' seconds)':''));await new Promise(res=>setTimeout(res,1100*(i+1)));continue;}
+    throw new Error('Toggl '+r.status);
   }
   throw new Error('Toggl request failed after retries');
 }
@@ -433,14 +343,15 @@ async function togglReportsRange(token, ws, a) {
     if (nextId) body.first_id = nextId;
     const r = await fetch(REPORTS_BASE + '/workspace/' + ws + '/search/time_entries', { method:'POST', headers:{ Authorization: togglAuthHeader(token), 'Content-Type':'application/json' }, body: JSON.stringify(body) });
     const txt = await r.text(); let d; try { d=JSON.parse(txt); } catch { d=txt; }
-    if (!r.ok) throw new Error('Toggl Reports ' + r.status);
-    const arr = Array.isArray(d) ? d : (d?.time_entries || d?.data || []);
-    out.push(...arr);
-    const nr = r.headers.get('X-Next-Row-Number'), ni = r.headers.get('X-Next-ID');
-    if (!arr.length || !nr || String(nr)===String(row)) break;
-    row = Number(nr); nextId = ni || null;
+    if(r.status===402){const reset=r.headers.get('X-Toggl-Quota-Resets-In');throw new Error('Toggl Reports quota exhausted'+(reset?' (resets in '+reset+' seconds)':''));}
+    if(!r.ok)throw new Error('Toggl Reports '+r.status);
+    const arr = Array.isArray(d) ? d : (d?.time_entries || d?.data || []); out.push(...arr);
+    const nr=r.headers.get('X-Next-Row-Number'),ni=r.headers.get('X-Next-ID'),remaining=Number(r.headers.get('X-Toggl-Quota-Remaining'));
+    if(!arr.length||!nr||String(nr)===String(row))break;
+    if(Number.isFinite(remaining)&&remaining<=1){out.partial=true;break;}
+    row=Number(nr);nextId=ni||null;
   }
-  const m = new Map(); for (const x of out) m.set(x.id, x); return [...m.values()];
+  const m = new Map(); for (const x of out) m.set(x.id, x); const result=[...m.values()]; if(out.partial) result.partial=true; return result;
 }
 async function togglFetchRange(token, ws, a, depth=0) {
   if (a && rangeDays(a) > 93) return togglReportsRange(token, ws, a);
@@ -452,7 +363,7 @@ async function togglFetchRange(token, ws, a, depth=0) {
   const mid = m.toISOString().slice(0,10), next = new Date(m.getTime()+86400000).toISOString().slice(0,10);
   const l = await togglFetchRange(token, ws, {start_date:a.start_date,end_date:mid}, depth+1);
   const r = await togglFetchRange(token, ws, {start_date:next,end_date:a.end_date}, depth+1);
-  const mm = new Map(); for (const x of [...l,...r]) mm.set(x.id,x); return [...mm.values()];
+  const mm = new Map(); for (const x of [...l,...r]) mm.set(x.id,x); const result=[...mm.values()]; if(l.partial||r.partial) result.partial=true; return result;
 }
 
 // ─── Per-account cache context ───────────────────────────────────────────────
@@ -466,7 +377,7 @@ async function makeCtx(env, grant) {
     kEntries: 'u:' + acctHash + ':entries',
     kProjects: 'u:' + acctHash + ':projects',
     kTags: 'u:' + acctHash + ':tags',
-    entries: [], ranges: [], entriesAt: 0, todayAt: 0,
+    entries: [], ranges: [], entriesAt: 0, todayAt: 0, incomplete: false,
     projects: null, tags: null,
     prov: { entries:'miss', projects:'miss', tags:'miss', upstream: [] },
   };
@@ -486,7 +397,6 @@ function mergeEntries(list, add) {
   const m = new Map(list.map(x=>[x.id,x]));
   for (const x of add) if (x && x.id != null) m.set(x.id, x);
   let out = [...m.values()].sort((a,b)=>String(a.start).localeCompare(String(b.start)));
-  if (out.length > MAX_ENTRIES) out = out.slice(-MAX_ENTRIES);
   return out;
 }
 function findGaps(ranges, s, e) {
@@ -508,7 +418,7 @@ async function loadEntriesCache(ctx) {
       const kd = JSON.parse(raw);
       if (Array.isArray(kd.entries) && Array.isArray(kd.ranges)) {
         ctx.entries = kd.entries; ctx.ranges = kd.ranges;
-        ctx.entriesAt = Number(kd.at)||0; ctx.todayAt = Number(kd.todayAt)||0;
+        ctx.entriesAt = Number(kd.at)||0; ctx.todayAt = Number(kd.todayAt)||0; ctx.incomplete = !!kd.incomplete;
         ctx.prov.entries = 'kv_hit';
         return;
       }
@@ -517,7 +427,7 @@ async function loadEntriesCache(ctx) {
   ctx.prov.entries = ctx.entries.length ? 'memory_hit' : 'miss';
 }
 async function saveEntriesCache(ctx) {
-  await kvPutRaw(ctx.env, ctx.kEntries, JSON.stringify({ entries: ctx.entries, ranges: ctx.ranges, at: ctx.entriesAt, todayAt: ctx.todayAt }), 2592000);
+  await kvPutRaw(ctx.env, ctx.kEntries, JSON.stringify({ entries: ctx.entries, ranges: ctx.ranges, at: ctx.entriesAt, todayAt: ctx.todayAt, incomplete:!!ctx.incomplete }), 2592000);
 }
 async function ensureProjects(ctx) {
   if (ctx.projects) { ctx.prov.projects = 'memory_hit'; return; }
@@ -541,7 +451,7 @@ async function ensureTags(ctx) {
 async function ensureEntries(ctx, a, opts) {
   opts = opts || {};
   const force = !!opts.force;
-  const tz = a.timezone || 'UTC';
+  const tz = a.timezone || ctx.profileTz || 'UTC';
   const today = dayKey(Date.now(), tz);
   const reqS = a.start_date, reqE = a.end_date;
   const w = warmWindow(reqS, reqE);
@@ -551,6 +461,7 @@ async function ensureEntries(ctx, a, opts) {
     ctx.prov.entries = 'fetch'; ctx.prov.upstream.push('/me/time_entries');
     const fd = await togglFetchRange(ctx.token, ctx.ws, { start_date: reqS, end_date: reqE });
     if (Array.isArray(fd)) {
+      ctx.incomplete = !!fd.partial;
       ctx.entries = ctx.entries.filter(x => { const dk = dayKey(x.start, tz); return dk < reqS || dk > reqE; });
       ctx.entries = mergeEntries(ctx.entries, fd);
       ctx.ranges = unionRanges(ctx.ranges, [{s:reqS,e:reqE}]);
@@ -581,17 +492,18 @@ async function ensureEntries(ctx, a, opts) {
     if (g.s > g.e) continue;
     ctx.prov.upstream.push('/me/time_entries');
     const part = await togglFetchRange(ctx.token, ctx.ws, { start_date: g.s, end_date: g.e });
-    if (Array.isArray(part)) { ctx.entries = mergeEntries(ctx.entries, part); ctx.ranges = unionRanges(ctx.ranges, [{s:g.s,e:g.e}]); }
+    if (Array.isArray(part)) { ctx.entries = mergeEntries(ctx.entries, part); if(part.partial) ctx.incomplete=true; else ctx.ranges = unionRanges(ctx.ranges, [{s:g.s,e:g.e}]); }
   }
   ctx.entriesAt = Date.now(); if (touchesToday) ctx.todayAt = Date.now();
   await saveEntriesCache(ctx);
 }
 function effDuration(x) {
-  const d = Number(x && x.duration);
-  if (Number.isFinite(d) && d >= 0) return d;
-  const st = (x && x.start) ? new Date(x.start).getTime() : NaN;
-  if (!isNaN(st)) return Math.max(0, Math.floor((Date.now() - st) / 1000));
-  return 0;
+  const d=Number(x&&x.duration); if(Number.isFinite(d)&&d>=0)return d;
+  const st=x&&x.start?new Date(x.start).getTime():NaN; if(!isNaN(st))return Math.max(0,Math.floor((Date.now()-st)/1000)); return 0;
+}
+function durationWithinWindow(x,a){
+  const xs=x&&x.start?new Date(x.start).getTime():NaN, xe=x&&x.stop?new Date(x.stop).getTime():Date.now(); if(!Number.isFinite(xs)||!Number.isFinite(xe))return 0;
+  const s=Math.max(xs,Number.isFinite(a._startMs)?a._startMs:xs), e=Math.min(xe,Number.isFinite(a._endMs)?a._endMs:xe); return e>s?Math.floor((e-s)/1000):0;
 }
 function filterByDate(ctx, entries, a) {
   let s = a._startMs || 0, e = a._endMs || Infinity;
@@ -682,7 +594,7 @@ function cacheMeta(ctx, tz) {
     today_built_at: ctx.todayAt ? new Date(ctx.todayAt).toISOString() : null,
     freshness_seconds: ctx.entriesAt ? Math.round((Date.now()-ctx.entriesAt)/1000) : null,
     entry_count: ctx.entries.length, max_start: maxStart, max_stop: maxStop,
-    coverage: ctx.ranges || null, today_fresh: !!(ctx.todayAt && (Date.now()-ctx.todayAt < TODAY_TTL)),
+    coverage: ctx.ranges || null, today_fresh: !!(ctx.todayAt && (Date.now()-ctx.todayAt < TODAY_TTL)), partial:!!ctx.incomplete,
   };
 }
 
@@ -706,42 +618,30 @@ function toolsList() {
     update_tag: 'Rename an existing Toggl tag.',
     delete_tag: 'Delete a Toggl tag. Destructive.',
   };
-  const rangeSchema = {
-    type:'object',
-    properties:{
-      start_date:{type:'string'}, end_date:{type:'string'},
-      project_ids:{type:'array',items:{type:'number'}}, project_names:{type:'array',items:{type:'string'}},
-      description_contains:{type:'string',description:'Case-insensitive substring in the entry DESCRIPTION only. This does not search project names. If it returns zero, inspect meta.filter_diagnostics before concluding no activity exists.'}, min_duration_seconds:{type:'number',description:'Minimum duration in seconds. Running entries are measured as elapsed time so far. Useful for locating long blocks when categorisation is unreliable (missing or wrong project): combine with fields [local_start_time, local_stop_time] to screen candidates by time pattern instead of by project.'},
-      intersects_range:{type:'boolean',description:'If true, return entries whose interval OVERLAPS the query range instead of only those whose start falls inside it. Required to see activities that cross midnight from the previous day. Use day_anchor="next_day" instead when each overnight block should belong to a single night.'}, fields:{type:'array',items:{type:'string'},description:'Optional field list. Extra available: project_name, local_start_date, local_start_time, local_stop_date, local_stop_time (already timezone-converted). If the timezone is unknown (no argument and no profile timezone), these are returned as utc_* instead of local_* and meta.warnings explains why \u2014 never present utc_* values as local wall-clock time.'}, limit:{type:'number',description:'Max entries per page (default and cap 1000).'}, offset:{type:'number',description:'Zero-based page offset. Use meta.pagination.next_offset to fetch the next page with otherwise identical arguments.'},
-      timezone:{type:'string'},
-      day_anchor:{type:'string',description:'"start" (default) = dates mean the calendar day the entry STARTS. "next_day" = night-of/opening-day convention (an entry starting the evening before belongs to the following day); server shifts window, missing_dates, and day grouping.'},
-      force_refresh:{type:'boolean',description:'Bypass cache and ALWAYS call Toggl (costs quota). Only when the user explicitly asks to refresh or says data changed.'},
-    },
-    required:['start_date','end_date'],
-  };
+  const rangeSchema = { type:'object', additionalProperties:false, properties:{
+    start_date:{type:'string'}, end_date:{type:'string'}, project_ids:{type:'array',items:{type:'integer'}}, project_names:{type:'array',items:{type:'string'}},
+    description_contains:{type:'string'}, min_duration_seconds:{type:'number',minimum:0}, intersects_range:{type:'boolean'}, fields:{type:'array',items:{type:'string'}}, limit:{type:'integer',minimum:1,maximum:1000,description:'Maximum entries per page. Default and maximum are 1000.'}, offset:{type:'integer',minimum:0}, timezone:{type:'string'}, day_anchor:{type:'string',enum:['start','next_day']}, force_refresh:{type:'boolean'}
+  }, required:['start_date','end_date'] };
   const t = [
-    { name:'get_current_time_entry', inputSchema:{type:'object',properties:{}} },
-    { name:'get_time_entries_with_project_tag', inputSchema: rangeSchema },
-    { name:'get_summary', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},group_by:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
-    { name:'get_coverage', inputSchema:{type:'object',properties:{start_date:{type:'string'},end_date:{type:'string'},project_ids:{type:'array',items:{type:'number'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string'},force_refresh:{type:'boolean'}},required:['start_date','end_date']} },
-    { name:'browse_projects_catalog', inputSchema:{type:'object',properties:{}} },
-    { name:'browse_tags_catalog', inputSchema:{type:'object',properties:{}} },
-    { name:'create_time_entry', inputSchema:{type:'object',properties:{description:{type:'string'},start:{type:'string'},duration:{type:'number'},stop:{type:'string'},project_id:{type:'number'},tags:{type:'array',items:{type:'string'}},billable:{type:'boolean'}}} },
-    { name:'update_time_entry', inputSchema:{type:'object',properties:{entry_id:{type:'number'},description:{type:'string'},start:{type:'string'},stop:{type:'string'},duration:{type:'number'},project_id:{type:'number'},tags:{type:'array',items:{type:'string'}},billable:{type:'boolean'}}} },
-    { name:'stop_time_entry', inputSchema:{type:'object',properties:{entry_id:{type:'number'}}} },
-    { name:'delete_time_entry', inputSchema:{type:'object',properties:{entry_id:{type:'number'}}} },
-    { name:'create_project', inputSchema:{type:'object',properties:{name:{type:'string'},color:{type:'string'},billable:{type:'boolean'},active:{type:'boolean'},client_id:{type:'number'}}} },
-    { name:'update_project', inputSchema:{type:'object',properties:{project_id:{type:'number'},name:{type:'string'},color:{type:'string'},billable:{type:'boolean'},active:{type:'boolean'}}} },
-    { name:'delete_project', inputSchema:{type:'object',properties:{project_id:{type:'number'}}} },
-    { name:'create_tag', inputSchema:{type:'object',properties:{name:{type:'string'}}} },
-    { name:'update_tag', inputSchema:{type:'object',properties:{tag_id:{type:'number'},name:{type:'string'}}} },
-    { name:'delete_tag', inputSchema:{type:'object',properties:{tag_id:{type:'number'}}} },
+    {name:'get_current_time_entry',inputSchema:{type:'object',additionalProperties:false,properties:{}}},
+    {name:'get_time_entries_with_project_tag',inputSchema:rangeSchema},
+    {name:'get_summary',inputSchema:{type:'object',additionalProperties:false,properties:{start_date:{type:'string'},end_date:{type:'string'},group_by:{type:'string',enum:['project','day','tag','project_day']},project_ids:{type:'array',items:{type:'integer'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string',enum:['start','next_day']},force_refresh:{type:'boolean'}},required:['start_date','end_date']}},
+    {name:'get_coverage',inputSchema:{type:'object',additionalProperties:false,properties:{start_date:{type:'string'},end_date:{type:'string'},project_ids:{type:'array',items:{type:'integer'}},project_names:{type:'array',items:{type:'string'}},timezone:{type:'string'},day_anchor:{type:'string',enum:['start','next_day']},force_refresh:{type:'boolean'}},required:['start_date','end_date']}},
+    {name:'browse_projects_catalog',inputSchema:{type:'object',additionalProperties:false,properties:{}}},{name:'browse_tags_catalog',inputSchema:{type:'object',additionalProperties:false,properties:{}}},
+    {name:'create_time_entry',inputSchema:{type:'object',additionalProperties:false,properties:{description:{type:'string'},start:{type:'string'},duration:{type:'number'},stop:{type:'string'},project_id:{type:'integer'},tags:{type:'array',items:{type:'string'}},billable:{type:'boolean'}},required:['start','duration']}},
+    {name:'update_time_entry',inputSchema:{type:'object',additionalProperties:false,properties:{entry_id:{type:'integer'},description:{type:'string'},start:{type:'string'},stop:{type:'string'},duration:{type:'number'},project_id:{type:'integer'},tags:{type:'array',items:{type:'string'}},billable:{type:'boolean'}},required:['entry_id']}},
+    {name:'stop_time_entry',inputSchema:{type:'object',additionalProperties:false,properties:{entry_id:{type:'integer'}},required:['entry_id']}},{name:'delete_time_entry',inputSchema:{type:'object',additionalProperties:false,properties:{entry_id:{type:'integer'}},required:['entry_id']}},
+    {name:'create_project',inputSchema:{type:'object',additionalProperties:false,properties:{name:{type:'string'},color:{type:'string'},billable:{type:'boolean'},active:{type:'boolean'},client_id:{type:'integer'}},required:['name']}},{name:'update_project',inputSchema:{type:'object',additionalProperties:false,properties:{project_id:{type:'integer'},name:{type:'string'},color:{type:'string'},billable:{type:'boolean'},active:{type:'boolean'}},required:['project_id']}},{name:'delete_project',inputSchema:{type:'object',additionalProperties:false,properties:{project_id:{type:'integer'}},required:['project_id']}},
+    {name:'create_tag',inputSchema:{type:'object',additionalProperties:false,properties:{name:{type:'string'}},required:['name']}},{name:'update_tag',inputSchema:{type:'object',additionalProperties:false,properties:{tag_id:{type:'integer'},name:{type:'string'}},required:['tag_id','name']}},{name:'delete_tag',inputSchema:{type:'object',additionalProperties:false,properties:{tag_id:{type:'integer'}},required:['tag_id']}}
   ];
   const ro = new Set(['get_current_time_entry','get_time_entries_with_project_tag','get_summary','get_coverage','browse_projects_catalog','browse_tags_catalog']);
   for (const x of t) { x.description = D[x.name]; x.annotations = { readOnlyHint: ro.has(x.name), destructiveHint: !ro.has(x.name) }; }
   return t;
 }
 
+function pickFields(obj, fields) { const out={}; for(const f of fields) if(obj[f]!==undefined) out[f]=obj[f]; return out; }
+function timeEntryPayload(a, ws, includeCreated=true) { const out=pickFields(a,['description','start','duration','stop','project_id','tags','billable']); out.workspace_id=Number(ws); if(includeCreated)out.created_with='toggl-track-mcp'; return out; }
+function projectPayload(a, ws) { const out=pickFields(a,['name','color','billable','active','client_id']); out.workspace_id=Number(ws); return out; }
 async function executeTool(name, a, env, grant) {
   if (!grant) throw new Error('Not authenticated');
   const ctx = await makeCtx(env, grant);
@@ -781,7 +681,7 @@ async function executeTool(name, a, env, grant) {
         returned: limited.length, total_count: out.length,
         entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects,
         upstream_calls: ctx.prov.upstream,
-        completeness: (out.length <= limited.length) ? ((a.end_date >= today) ? 'unverified' : true) : false,
+        completeness: ctx.incomplete ? false : ((out.length <= limited.length) ? ((a.end_date >= today) ? 'unverified' : true) : false),
         date_facts: dateFacts(out, a, tz),
         pagination: { offset: pgOff, limit: pgLimit, returned: limited.length, total_count: out.length, has_more: pgHasMore, next_offset: pgHasMore ? (pgOff + limited.length) : null, report_ready: !pgHasMore },
         truncation_hint: pgHasMore ? { reason: 'result_exceeds_page_limit', project_filter_applied: pgFiltered, recommended: pgFiltered ? 'Repeat this exact request with offset=next_offset and merge all pages before analysing.' : 'Narrow the query with project_ids/project_names first (or use get_summary); paginate with offset=next_offset only if the filtered result still exceeds the page limit.' } : undefined,
@@ -801,14 +701,15 @@ async function executeTool(name, a, env, grant) {
     a._startMs = ds.getTime(); a._endMs = endExclusiveMs(a.end_date, de);
     normalizeBounds(a, tz);
     await ensureEntries(ctx, a, { force: !!a.force_refresh });
-    await ensureProjects(ctx);
+    const needsProjects = name==='get_summary' ? (!!(a.project_names&&a.project_names.length) || !!a.description_contains || ['project','project_day'].includes(a.group_by||'project')) : !!(a.project_names&&a.project_names.length);
+    if(needsProjects) await ensureProjects(ctx); else ctx.prov.projects='not_needed';
     const rows = filterByDate(ctx, ctx.entries, a);
     const today = dayKey(Date.now(), tz);
-    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), filter_diagnostics: filterDiagnostics(ctx, a), source_timezone: tz, times_are_in: tz, timezone_source: tzSource, warnings: tzKnown ? undefined : ['Times are rendered in UTC because no timezone argument was given and the Toggl profile timezone was unavailable. Pass timezone (e.g. "Asia/Jakarta") for correct local times and day boundaries.'], completeness: (a.end_date >= today) ? 'unverified' : true };
+    const commonMeta = { status:'ok', entries_cache: ctx.prov.entries, projects_cache: ctx.prov.projects, upstream_calls: ctx.prov.upstream, cache: cacheMeta(ctx, tz), filter_diagnostics: filterDiagnostics(ctx, a), source_timezone: tz, times_are_in: tz, timezone_source: tzSource, warnings: tzKnown ? undefined : ['Times are rendered in UTC because no timezone argument was given and the Toggl profile timezone was unavailable. Pass timezone (e.g. "Asia/Jakarta") for correct local times and day boundaries.'], completeness: ctx.incomplete ? false : ((a.end_date >= today) ? 'unverified' : true) };
 
     if (name === 'get_coverage') {
       const days = {};
-      for (const x of rows) { const d = dayKey(x.start, tz); const z = days[d] || (days[d]={count:0,seconds:0}); z.count++; z.seconds += effDuration(x); }
+      for (const x of rows) { const d = dayKey(x.start, tz); const z = days[d] || (days[d]={count:0,seconds:0}); z.count++; z.seconds += durationWithinWindow(x,a); }
       const out = []; let cursor = new Date(dayKey(new Date(a._startMs).toISOString(), tz)+'T12:00:00Z');
       const limit = new Date(dayKey(new Date(a._endMs-1).toISOString(), tz)+'T12:00:00Z');
       while (cursor <= limit) { const k = cursor.toISOString().slice(0,10); out.push({ date:k, entry_count:(days[k]||{count:0}).count, tracked_seconds:(days[k]||{seconds:0}).seconds }); cursor.setUTCDate(cursor.getUTCDate()+1); }
@@ -821,13 +722,14 @@ async function executeTool(name, a, env, grant) {
     for (const x of rows) {
       const pn = ctx.projects?.[x.project_id]?.name || 'Unknown';
       let day = dayKey(x.start, tz); if (a.day_anchor === 'next_day') day = dAdd(day,1);
-      const keys = g==='day' ? [day] : g==='tag' ? (x.tags||[]).map(t=>'tag:'+t) : g==='project_day' ? [x.project_id+':'+day] : [x.project_id+':'+pn];
+      const tagKeys = Array.isArray(x.tags) && x.tags.length ? x.tags.map(t=>'tag:'+t) : ['tag:__untagged__'];
+      const keys = g==='day' ? [day] : g==='tag' ? tagKeys : g==='project_day' ? [x.project_id+':'+day] : [x.project_id+':'+pn];
       for (const k of keys) {
         const z = m[k] || (m[k]={key:k,count:0,seconds:0});
         if (g==='project'||g==='project_day') { z.project_id = x.project_id||null; z.project_name = pn; }
         if (g==='day'||g==='project_day') z.date = day;
-        if (g==='tag') z.tag = k.slice(4);
-        z.count++; z.seconds += effDuration(x);
+        if (g==='tag') { z.tag = k==='tag:__untagged__' ? null : k.slice(4); if(k==='tag:__untagged__') z.untagged=true; }
+        z.count++; z.seconds += durationWithinWindow(x,a);
       }
     }
     return { groups: Object.values(m), meta: commonMeta };
@@ -840,12 +742,12 @@ async function executeTool(name, a, env, grant) {
   async function invalidateEntries() { await loadEntriesCache(ctx); }
   if (name === 'create_time_entry') {
     ctx.prov.upstream.push('POST /time_entries');
-    const r = await togglPost(token, '/workspaces/'+ws+'/time_entries', { ...a, workspace_id: Number(ws) });
+    const r = await togglPost(token, '/workspaces/'+ws+'/time_entries', timeEntryPayload(a,ws));
     await patchWrite(ctx, 'create', r, null, tz); return r;
   }
   if (name === 'update_time_entry') {
     if (!a.entry_id) throw new Error('entry_id required');
-    const b = { ...a }; delete b.entry_id;
+    const b = timeEntryPayload(a,ws,false); delete b.workspace_id; delete b.created_with; delete b.entry_id;
     const r = await togglPut(token, '/workspaces/'+ws+'/time_entries/'+a.entry_id, b);
     await patchWrite(ctx, 'update', r, Number(a.entry_id), tz); return r;
   }
@@ -859,8 +761,8 @@ async function executeTool(name, a, env, grant) {
     const r = await togglDelete(token, '/workspaces/'+ws+'/time_entries/'+a.entry_id);
     await patchWrite(ctx, 'delete', null, Number(a.entry_id), tz); return { ok: true };
   }
-  if (name === 'create_project') { const r = await togglPost(token, '/workspaces/'+ws+'/projects', { ...a, workspace_id: Number(ws) }); await kvDel(env, ctx.kProjects); return r; }
-  if (name === 'update_project') { if(!a.project_id) throw new Error('project_id required'); const b={...a}; delete b.project_id; const r = await togglPut(token, '/workspaces/'+ws+'/projects/'+a.project_id, b); await kvDel(env, ctx.kProjects); return r; }
+  if (name === 'create_project') { const r = await togglPost(token, '/workspaces/'+ws+'/projects', projectPayload(a,ws)); await kvDel(env, ctx.kProjects); return r; }
+  if (name === 'update_project') { if(!a.project_id) throw new Error('project_id required'); const b=projectPayload(a,ws); delete b.project_id; delete b.workspace_id; const r = await togglPut(token, '/workspaces/'+ws+'/projects/'+a.project_id, b); await kvDel(env, ctx.kProjects); return r; }
   if (name === 'delete_project') { if(!a.project_id) throw new Error('project_id required'); const r = await togglDelete(token, '/workspaces/'+ws+'/projects/'+a.project_id); await kvDel(env, ctx.kProjects); return { ok:true }; }
   if (name === 'create_tag') { const r = await togglPost(token, '/workspaces/'+ws+'/tags', { name:a.name, workspace_id:Number(ws) }); await kvDel(env, ctx.kTags); return r; }
   if (name === 'update_tag') { if(!a.tag_id) throw new Error('tag_id required'); const r = await togglPut(token, '/workspaces/'+ws+'/tags/'+a.tag_id, { name:a.name }); await kvDel(env, ctx.kTags); return r; }
@@ -873,7 +775,8 @@ async function patchWrite(ctx, op, entry, id, tz) {
   await loadEntriesCache(ctx);
   if (!ctx.entries.length && !(ctx.ranges||[]).length) return;
   if (op === 'delete' && id != null) ctx.entries = ctx.entries.filter(x => x.id !== id);
-  else if (entry && entry.id != null) { ctx.entries = ctx.entries.filter(x => x.id !== entry.id); ctx.entries.push(entry); }
+  else if (entry && entry.id != null) ctx.entries = mergeEntries(ctx.entries, [entry]);
+  ctx.entries = mergeEntries([], ctx.entries);
   await saveEntriesCache(ctx);
 }
 async function togglPost(token, path, body) { return togglWrite(token, 'POST', path, body); }
@@ -887,35 +790,90 @@ async function togglWrite(token, method, path, body) {
   return d;
 }
 
+const MCP_PROTOCOLS = [MCP_PROTOCOL];
+const TOOL_KEYS = {
+  get_current_time_entry: [],
+  get_time_entries_with_project_tag: ['start_date','end_date','project_ids','project_names','description_contains','min_duration_seconds','intersects_range','fields','limit','offset','timezone','day_anchor','force_refresh'],
+  get_summary: ['start_date','end_date','group_by','project_ids','project_names','timezone','day_anchor','force_refresh'],
+  get_coverage: ['start_date','end_date','project_ids','project_names','timezone','day_anchor','force_refresh'],
+  browse_projects_catalog: [], browse_tags_catalog: [],
+  create_time_entry: ['description','start','duration','stop','project_id','tags','billable'],
+  update_time_entry: ['entry_id','description','start','duration','stop','project_id','tags','billable'],
+  stop_time_entry: ['entry_id'], delete_time_entry: ['entry_id'],
+  create_project: ['name','color','billable','active','client_id'], update_project: ['project_id','name','color','billable','active'], delete_project: ['project_id'],
+  create_tag: ['name'], update_tag: ['tag_id','name'], delete_tag: ['tag_id'],
+};
+const VALID_SHAPE_FIELDS = new Set(['id','start','stop','duration','description','project_id','tags','billable','workspace_id','user_id','task_id','at','created_with','project_name','project.name','local_start_date','local_start_time','local_stop_date','local_stop_time']);
+function requireInteger(v,name,min=0,max=Number.MAX_SAFE_INTEGER){if(typeof v!=='number'||!Number.isInteger(v)||v<min||v>max)throw new Error(name+' must be an integer between '+min+' and '+max);}
+function validateToolArgs(name,a){
+  if(!a||typeof a!=='object'||Array.isArray(a))throw new Error('Tool arguments must be an object');
+  const allowed=TOOL_KEYS[name]; if(!allowed)throw new Error('Unknown tool: '+name);
+  for(const k of Object.keys(a))if(!allowed.includes(k))throw new Error('Unknown argument: '+k);
+  const needs=['get_time_entries_with_project_tag','get_summary','get_coverage']; if(needs.includes(name)){if(typeof a.start_date!=='string'||typeof a.end_date!=='string'||!a.start_date||!a.end_date)throw new Error('start_date and end_date are required');}
+  if(name==='get_summary'&&a.group_by!==undefined&&!['project','day','tag','project_day'].includes(a.group_by))throw new Error('group_by must be project, day, tag, or project_day');
+  if(a.day_anchor!==undefined&&!['start','next_day'].includes(a.day_anchor))throw new Error('day_anchor must be start or next_day');
+  if(a.limit!==undefined)requireInteger(a.limit,'limit',1,1000); if(a.offset!==undefined)requireInteger(a.offset,'offset',0);
+  if(a.project_ids!==undefined){if(!Array.isArray(a.project_ids)||a.project_ids.some(x=>typeof x!=='number'||!Number.isInteger(x)))throw new Error('project_ids must be an integer array');}
+  if(a.project_names!==undefined&&(!Array.isArray(a.project_names)||a.project_names.some(x=>typeof x!=='string')))throw new Error('project_names must be a string array');
+  if(a.fields!==undefined&&(!Array.isArray(a.fields)||a.fields.some(x=>typeof x!=='string'||!VALID_SHAPE_FIELDS.has(x))))throw new Error('fields contains an unsupported field');
+  for(const k of ['force_refresh','intersects_range','billable','active'])if(a[k]!==undefined&&typeof a[k]!=='boolean')throw new Error(k+' must be boolean');
+  if(a.min_duration_seconds!==undefined&&(typeof a.min_duration_seconds!=='number'||!Number.isFinite(a.min_duration_seconds)||a.min_duration_seconds<0))throw new Error('min_duration_seconds must be a non-negative number');
+  if(name==='create_time_entry'&& (typeof a.start!=='string'||typeof a.duration!=='number'))throw new Error('create_time_entry requires start and duration');
+  if(['update_time_entry','stop_time_entry','delete_time_entry'].includes(name)&&(!Number.isInteger(a.entry_id)||a.entry_id<=0))throw new Error('entry_id must be a positive integer');
+  if(name==='update_time_entry'&&!Object.keys(a).some(k=>k!=='entry_id'))throw new Error('update_time_entry requires a mutable field');
+  if(['create_project','create_tag'].includes(name)&&typeof a.name!=='string'&&! (name==='create_project'&&typeof a.name==='string'))throw new Error(name+' requires name');
+  if(name==='create_project'&&(!a.name||typeof a.name!=='string'))throw new Error('create_project requires name');
+  if(name==='create_tag'&&(!a.name||typeof a.name!=='string'))throw new Error('create_tag requires name');
+  if(['update_project','delete_project'].includes(name)&&(!Number.isInteger(a.project_id)||a.project_id<=0))throw new Error('project_id must be a positive integer');
+  if(name==='update_project'&&!Object.keys(a).some(k=>k!=='project_id'))throw new Error('update_project requires a mutable field');
+  if(['update_tag','delete_tag'].includes(name)&&(!Number.isInteger(a.tag_id)||a.tag_id<=0))throw new Error('tag_id must be a positive integer');
+  if(name==='update_tag'&&(!a.name||typeof a.name!=='string'))throw new Error('update_tag requires name');
+  if(a.timezone!==undefined){try{new Intl.DateTimeFormat('en-US',{timeZone:a.timezone}).format();}catch{throw new Error('Invalid IANA timezone');}}
+  return a;
+}
+
 // ─── MCP handler ─────────────────────────────────────────────────────────────
 async function handleMCP(request, env, grant) {
-  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-  const body = await request.json();
-  const id = body.id ?? null;
-  const method = body.method;
-  if (method === 'initialize') {
-    return json({ jsonrpc:'2.0', id, result: {
-      protocolVersion: body.params?.protocolVersion || MCP_PROTOCOL,
-      capabilities: { tools: {} },
-      serverInfo: { name: 'toggl-track-mcp', version: '1.0.0' },
-      instructions: 'Read-first, cache-first Toggl time tracking for YOUR connected account. NEVER infer date coverage from entry counts; read meta.date_facts.missing_dates or call get_coverage. description_contains searches entry description text only, not project names; if it returns zero, inspect meta.filter_diagnostics and retry with an exact project_names value when appropriate. Do not call the project catalog because the primary read tool already loaded project data. For overnight activities (sleep), request fields [local_start_date, local_start_time, local_stop_time] or set day_anchor="next_day" rather than converting timezones yourself. A zero-result filter only means that filter did not match \u2014 it does NOT prove the data is absent. Before concluding something does not exist, check meta.filter_diagnostics and meta.date_facts. If the user states the data exists, or diagnostics show the range does contain entries while the filter returned zero, switch to pattern-based search (min_duration_seconds + intersects_range, no project filter) before answering; if the range is genuinely empty, "none" is the correct answer. Raw entries are paginated (max 1000): when meta.pagination.report_ready is false the data is partial \u2014 narrow the filter or continue with offset=meta.pagination.next_offset before reporting. PRIMARY read tool: get_time_entries_with_project_tag (entries + project map + tags in one call). Use get_summary (group_by=project) or get_coverage before large raw-entry queries. NEVER call browse_projects_catalog or browse_tags_catalog for reporting/analysis/filtering — project id+name already appear in get_summary groups and the projects map. end_date is inclusive of the whole local day. Provide timezone (e.g. Asia/Jakarta) for correct day boundaries. Cache is authoritative for past days; the current day may lag up to ~1h — use force_refresh only when the user says data changed.',
-    }});
+  if(request.method!=='POST')return json({error:'Method not allowed'},405,{'Allow':'POST'});
+  const hdr=request.headers.get('MCP-Protocol-Version'); if(hdr&&!MCP_PROTOCOLS.includes(hdr))return jsonError('unsupported_protocol_version','Unsupported MCP-Protocol-Version',400);
+  let body; try{body=await request.json();}catch{return json({jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}},400);}
+  const id=body.id??null, method=body.method;
+  if(method==='initialize'){
+    const requested=body.params?.protocolVersion||MCP_PROTOCOL; const negotiated=MCP_PROTOCOLS.includes(requested)?requested:MCP_PROTOCOL;
+    return json({jsonrpc:'2.0',id,result:{protocolVersion:negotiated,capabilities:{tools:{}},serverInfo:{name:'toggl-track-mcp',version:'1.1.0'},instructions:'Read-first, cache-first Toggl time tracking for YOUR connected account. The primary read tool is get_time_entries_with_project_tag with a 1000-entry page cap. If report_ready is false, continue with offset or narrow the filter before reporting. Use get_summary or get_coverage for aggregates. Do not call catalogs for normal reporting. end_date is inclusive and end_date+1 is used internally for Toggl v9. Provide timezone for local boundaries. force_refresh costs Toggl quota and is only for explicit user refresh requests.'}});
   }
-  if (method === 'notifications/initialized') return new Response(null, { status: 202, headers: CORS });
-  if (method === 'tools/list') return json({ jsonrpc:'2.0', id, result: { tools: toolsList() } });
-  if (method === 'tools/call') {
-    const name = body.params?.name; const args = body.params?.arguments || {};
-    try {
-      const result = await executeTool(name, args, env, grant);
-      return json({ jsonrpc:'2.0', id, result: { content: [{ type:'text', text: typeof result==='string'?result:JSON.stringify(result) }] } });
-    } catch (e) {
-      return json({ jsonrpc:'2.0', id, result: { content: [{ type:'text', text: e.message || String(e) }], isError: true } });
-    }
+  if(method==='notifications/initialized')return new Response(null,{status:202,headers:CORS});
+  if(method==='ping')return json({jsonrpc:'2.0',id,result:{}});
+  if(method==='tools/list')return json({jsonrpc:'2.0',id,result:{tools:toolsList()}});
+  if(method==='tools/call'){
+    const name=body.params?.name,args=body.params?.arguments||{};
+    try{validateToolArgs(name,args);const result=await executeTool(name,{...args},env,grant);return json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:typeof result==='string'?result:JSON.stringify(result)}]}});}catch(e){return json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:e.message||String(e)}],isError:true}});}
   }
-  return json({ jsonrpc:'2.0', id, error: { code:-32601, message:'Method not found: '+method } });
+  return json({jsonrpc:'2.0',id,error:{code:-32601,message:'Method not found: '+method}});
 }
 
 // ─── Dispatcher ──────────────────────────────────────────────────────────────
+export class OAuthStateDO {
+  constructor(state, env) { this.state=state; this.env=env; }
+  async fetch(request) {
+    let body={}; try{body=await request.json();}catch{return new Response(JSON.stringify({ok:false,error:'invalid_state_request'}),{status:400,headers:{'content-type':'application/json'}});}
+    const now=Date.now(), current=await this.state.storage.get('record');
+    if(current&&current.expires_at&&current.expires_at<now){await this.state.storage.delete('record');}
+    const live=current&&(!current.expires_at||current.expires_at>=now)?current:null;
+    if(body.op==='create'){
+      if(live)return new Response(JSON.stringify({ok:false,error:'state_exists'}),{status:409,headers:{'content-type':'application/json'}});
+      const ttl=Number(body.ttl)||CODE_TTL; await this.state.storage.put('record',{record:body.record,expires_at:now+ttl*1000}); return new Response(JSON.stringify({ok:true,value:true}),{headers:{'content-type':'application/json'}});
+    }
+    if(body.op==='get')return new Response(JSON.stringify({ok:true,value:live?live.record:null}),{headers:{'content-type':'application/json'}});
+    if(body.op==='consume'){
+      if(!live)return new Response(JSON.stringify({ok:true,value:null}),{headers:{'content-type':'application/json'}});
+      await this.state.storage.delete('record'); return new Response(JSON.stringify({ok:true,value:live.record}),{headers:{'content-type':'application/json'}});
+    }
+    if(body.op==='revoke'){await this.state.storage.delete('record');return new Response(JSON.stringify({ok:true,value:true}),{headers:{'content-type':'application/json'}});}
+    return new Response(JSON.stringify({ok:false,error:'unknown_state_operation'}),{status:400,headers:{'content-type':'application/json'}});
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
